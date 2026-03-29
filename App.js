@@ -1,14 +1,17 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Constants from "expo-constants"
+import { StatusBar } from "expo-status-bar"
 import * as Notifications from "expo-notifications"
 import AsyncStorage from "@react-native-async-storage/async-storage"
 import { createClient } from "@supabase/supabase-js"
 import DateTimePicker from "@react-native-community/datetimepicker"
 import {
   ActivityIndicator,
+  AppState,
   Alert,
   Animated,
   BackHandler,
+  Dimensions,
   Keyboard,
   KeyboardAvoidingView,
   LayoutAnimation,
@@ -18,7 +21,6 @@ import {
   PanResponder,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   SectionList,
   StyleSheet,
@@ -26,11 +28,14 @@ import {
   TextInput,
   TouchableOpacity,
   UIManager,
-  View
+  View,
+  findNodeHandle
 } from "react-native"
 import { NavigationContainer, useFocusEffect } from "@react-navigation/native"
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs"
-import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context"
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
+import { GestureHandlerRootView } from "react-native-gesture-handler"
+import DraggableFlatList from "react-native-draggable-flatlist"
 
 const ACCENT_BLUE = "#2b67c7"
 const ACCENT_RED = "#d04b4b"
@@ -95,7 +100,10 @@ const PLAN_ALARM_LEAD_PREFS_KEY = "plannerMobile.planAlarmLeadPrefs.v1"
 const PLAN_NOTIFICATION_CHANNEL_ID = "planner-reminders"
 const PLAN_NOTIFICATION_MAX_COUNT = 60
 const PLAN_NOTIFICATION_LOOKAHEAD_DAYS = 180
+const OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS = 400
 const ENABLE_LEGACY_BROAD_DELETE_FALLBACK = false
+const DEFAULT_RIGHT_MEMO_DOC_TITLE = "기본 메모"
+const UNTITLED_RIGHT_MEMO_DOC_TITLE = "새 메모"
 
 if (Platform.OS !== "web") {
   Notifications.setNotificationHandler({
@@ -153,10 +161,43 @@ function weekdayColor(dateKey, { isHoliday, isDark } = {}) {
   return isDark ? DARK_TEXT : "#0f172a"
 }
 
+function parseHexColorToRgb(value) {
+  const raw = String(value ?? "").trim()
+  const hex = raw.startsWith("#") ? raw.slice(1) : raw
+  if (/^[0-9a-fA-F]{3}$/.test(hex)) {
+    return {
+      r: Number.parseInt(hex[0] + hex[0], 16),
+      g: Number.parseInt(hex[1] + hex[1], 16),
+      b: Number.parseInt(hex[2] + hex[2], 16)
+    }
+  }
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+    return {
+      r: Number.parseInt(hex.slice(0, 2), 16),
+      g: Number.parseInt(hex.slice(2, 4), 16),
+      b: Number.parseInt(hex.slice(4, 6), 16)
+    }
+  }
+  return null
+}
+
+function getReadableCalendarTextColor(backgroundColor) {
+  const rgb = parseHexColorToRgb(backgroundColor)
+  if (!rgb) return "#0f172a"
+  const luminance = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255
+  return luminance < 0.58 ? "#ffffff" : "#0f172a"
+}
+
 function formatDateMD(dateKey) {
   const dt = parseDateKey(dateKey)
   if (!dt) return String(dateKey ?? "")
   return `${dt.getMonth() + 1}/${dt.getDate()}`
+}
+
+function formatTodayHeaderText(dateValue = new Date()) {
+  const dt = dateValue instanceof Date ? dateValue : new Date()
+  const dateKey = dateToKey(dt.getFullYear(), dt.getMonth() + 1, dt.getDate())
+  return `${dt.getFullYear()}.${pad2(dt.getMonth() + 1)}.${pad2(dt.getDate())} (${weekdayLabel(dateKey)})`
 }
 
 function genClientId() {
@@ -216,6 +257,208 @@ function buildPlanTimeText(time, endTime = "") {
 function buildPlanTimeTextFromRow(row) {
   const { time, endTime } = normalizePlanTimeRange(row)
   return buildPlanTimeText(time, endTime)
+}
+
+function parsePlanMetaSuffixes(rawText) {
+  let baseRaw = String(rawText ?? "").trim()
+  if (!baseRaw) {
+    return { baseRaw: "", completed: null, marker: "", dday: false }
+  }
+
+  let completed = null
+  let marker = ""
+  let dday = false
+
+  while (baseRaw) {
+    const taskMatch = completed == null ? baseRaw.match(/^(.*?);\s*([OX])\s*$/i) : null
+    if (taskMatch) {
+      const nextBaseRaw = String(taskMatch[1] ?? "").trim()
+      if (!nextBaseRaw) break
+      baseRaw = nextBaseRaw
+      marker = String(taskMatch[2] ?? "").trim().toUpperCase()
+      completed = marker === "O"
+      continue
+    }
+
+    const ddayMatch = !dday ? baseRaw.match(/^(.*?);\s*D\s*$/i) : null
+    if (ddayMatch) {
+      const nextBaseRaw = String(ddayMatch[1] ?? "").trim()
+      if (!nextBaseRaw) break
+      baseRaw = nextBaseRaw
+      dday = true
+      continue
+    }
+
+    break
+  }
+
+  return {
+    baseRaw: baseRaw || String(rawText ?? "").trim(),
+    completed,
+    marker,
+    dday
+  }
+}
+
+function stripPlanMetaSuffix(rawText) {
+  const parsed = parsePlanMetaSuffixes(rawText)
+  return {
+    text: parsed.baseRaw || String(rawText ?? "").trim(),
+    completed: parsed.completed,
+    dday: parsed.dday
+  }
+}
+
+function getPlanDisplayText(row) {
+  return stripPlanMetaSuffix(row?.content).text
+}
+
+function hasVisiblePlanDisplayText(row) {
+  return Boolean(String(getPlanDisplayText(row) ?? "").trim())
+}
+
+function normalizePlanEntryType(value) {
+  const key = String(value ?? "plan").trim().toLowerCase()
+  return key === "task" ? "task" : "plan"
+}
+
+function getPlanEntryMeta(rawText) {
+  const parsed = parsePlanMetaSuffixes(rawText)
+  return {
+    text: parsed.baseRaw || String(rawText ?? "").trim(),
+    entryType: parsed.completed != null ? "task" : "plan",
+    taskCompleted: parsed.completed === true,
+    ddayEnabled: parsed.dday === true
+  }
+}
+
+function buildPlanContentWithMeta(baseText, entryType = "plan", taskCompleted = false, ddayEnabled = false) {
+  const parsed = parsePlanMetaSuffixes(baseText)
+  const text = String(parsed.baseRaw ?? baseText ?? "").trim()
+  if (!text) return ""
+  const normalizedType = normalizePlanEntryType(entryType)
+  let next = text
+  if (ddayEnabled) next += ";D"
+  if (normalizedType === "task") next += `;${taskCompleted ? "O" : "X"}`
+  return next
+}
+
+function getRepeatLabelFromPlanRow(row) {
+  const repeatType = normalizeRepeatType(row?.repeat_type ?? row?.repeatType)
+  const interval = normalizeRepeatInterval(row?.repeat_interval ?? row?.repeatInterval)
+  if (repeatType === "daily") return interval === 1 ? "매일" : `${interval}일마다`
+  if (repeatType === "weekly") return interval === 1 ? "매주" : `${interval}주마다`
+  if (repeatType === "monthly") return interval === 1 ? "매월" : `${interval}개월마다`
+  if (repeatType === "yearly") return interval === 1 ? "매년" : `${interval}년마다`
+  return ""
+}
+
+function buildTaskItemFromPlanRow(row) {
+  if (!isRenderablePlanRow(row)) return null
+  const parsed = parsePlanMetaSuffixes(row?.content)
+  if (parsed.completed == null) return null
+  const id = String(row?.id ?? "").trim()
+  const dateKey = String(row?.date ?? "").trim()
+  const title = String(row?.category_id ?? "").trim()
+  const text = String(parsed.baseRaw ?? "").trim()
+  if (!id || !dateKey || !text) return null
+
+  return {
+    id,
+    planId: id,
+    dateKey,
+    time: buildPlanTimeTextFromRow(row),
+    title: title && title !== "__general__" ? title : "",
+    text,
+    display: text,
+    completed: Boolean(parsed.completed),
+    dday: Boolean(parsed.dday),
+    repeatLabel: getRepeatLabelFromPlanRow(row),
+    row
+  }
+}
+
+function extractTaskItemsFromPlanRows(planRows) {
+  const items = []
+  for (const row of planRows ?? []) {
+    const item = buildTaskItemFromPlanRow(row)
+    if (item) items.push(item)
+  }
+  items.sort((a, b) => {
+    const dateDiff = keyToTime(a.dateKey) - keyToTime(b.dateKey)
+    if (dateDiff !== 0) return dateDiff
+    const timeA = String(a?.time ?? "")
+    const timeB = String(b?.time ?? "")
+    if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+    if (timeA && !timeB) return -1
+    if (!timeA && timeB) return 1
+    return String(a?.display ?? "").localeCompare(String(b?.display ?? ""), "ko")
+  })
+  return items
+}
+
+function formatDdayShortDate(dateKey) {
+  const parts = String(dateKey ?? "").trim().split("-")
+  if (parts.length !== 3) return String(dateKey ?? "").trim()
+  return `${Number(parts[1])}/${Number(parts[2])}`
+}
+
+function getDdayLabel(daysLeft) {
+  const days = Number(daysLeft)
+  if (!Number.isFinite(days)) return ""
+  if (days === 0) return "D-Day"
+  if (days > 0) return `D-${days}`
+  return `D+${Math.abs(days)}`
+}
+
+function extractUpcomingDdayItemsFromPlanRows(planRows, todayKey, maxDays = 10) {
+  const items = []
+  const todayMs = keyToTime(String(todayKey ?? "").trim())
+  if (!Number.isFinite(todayMs)) return items
+
+  for (const row of planRows ?? []) {
+    if (!isRenderablePlanRow(row)) continue
+    const parsed = parsePlanMetaSuffixes(row?.content)
+    if (!parsed.dday || parsed.completed === true) continue
+
+    const dateKey = String(row?.date ?? "").trim()
+    const dateMs = keyToTime(dateKey)
+    if (!dateKey || !Number.isFinite(dateMs)) continue
+
+    const daysLeft = Math.round((dateMs - todayMs) / 86400000)
+    if (daysLeft < 0 || daysLeft > maxDays) continue
+
+    const title = String(row?.category_id ?? "").trim()
+    const text = String(parsed.baseRaw ?? "").trim()
+    if (!text) continue
+
+    items.push({
+      id: `dday-${String(row?.id ?? "").trim() || `${dateKey}-${text}`}`,
+      planId: String(row?.id ?? "").trim(),
+      dateKey,
+      time: buildPlanTimeTextFromRow(row),
+      title: title && title !== "__general__" ? title : "",
+      text,
+      display: text,
+      daysLeft,
+      ddayLabel: getDdayLabel(daysLeft),
+      shortDateLabel: formatDdayShortDate(dateKey),
+      repeatLabel: getRepeatLabelFromPlanRow(row),
+      row
+    })
+  }
+
+  items.sort((a, b) => {
+    const dayDiff = (a?.daysLeft ?? 0) - (b?.daysLeft ?? 0)
+    if (dayDiff !== 0) return dayDiff
+    const timeA = String(a?.time ?? "")
+    const timeB = String(b?.time ?? "")
+    if (timeA && timeB && timeA !== timeB) return timeA.localeCompare(timeB)
+    if (timeA && !timeB) return -1
+    if (!timeA && timeB) return 1
+    return String(a?.display ?? "").localeCompare(String(b?.display ?? ""), "ko")
+  })
+  return items
 }
 
 function formatPlanTimeForDisplay(row) {
@@ -316,12 +559,24 @@ function normalizeRepeatDays(value) {
   return [...set].sort((a, b) => a - b)
 }
 
+function sameRepeatDays(a, b) {
+  const left = normalizeRepeatDays(a)
+  const right = normalizeRepeatDays(b)
+  if (left.length !== right.length) return false
+  return left.every((value, index) => value === right[index])
+}
+
 function dateFromDate(dateValue) {
   return new Date(dateValue.getFullYear(), dateValue.getMonth(), dateValue.getDate())
 }
 
 function dateKeyFromDate(dateValue) {
   return dateToKey(dateValue.getFullYear(), dateValue.getMonth() + 1, dateValue.getDate())
+}
+
+function keyToTime(dateKey) {
+  const dt = parseDateKey(dateKey)
+  return dt ? dt.getTime() : Number.NaN
 }
 
 function addDays(dateValue, amount) {
@@ -346,6 +601,19 @@ function addYearsClamped(dateValue, amount) {
   const maxDay = new Date(y, m + 1, 0).getDate()
   const d = Math.min(dateValue.getDate(), maxDay)
   return new Date(y, m, d)
+}
+
+function getOpenEndedRepeatHorizonDate(baseDate = new Date(), lookaheadDays = OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS) {
+  const start = baseDate instanceof Date ? dateFromDate(baseDate) : dateFromDate(new Date())
+  return addDays(start, Math.max(1, Number(lookaheadDays) || OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS))
+}
+
+function getOpenEndedRepeatSpanDays(startDateKey, baseDate = new Date(), lookaheadDays = OPEN_ENDED_REPEAT_LOOKAHEAD_DAYS) {
+  const start = parseDateKey(startDateKey)
+  if (!start) return REPEAT_DEFAULT_SPAN_DAYS
+  const horizonDate = getOpenEndedRepeatHorizonDate(baseDate, lookaheadDays)
+  const diffDays = Math.ceil((horizonDate.getTime() - dateFromDate(start).getTime()) / (24 * 60 * 60 * 1000))
+  return Math.max(REPEAT_DEFAULT_SPAN_DAYS, diffDays)
 }
 
 function normalizeRepeatMeta(input) {
@@ -478,7 +746,7 @@ function buildCombinedMemoText(windows, rightMemos) {
   const lines = []
   let prevHadBody = false
   for (const w of items) {
-    const body = String(rightMemos?.[w.id] ?? "").trimEnd()
+    const body = buildRightMemoCombinedText(rightMemos?.[w.id] ?? "").trimEnd()
     if (prevHadBody) lines.push("")
     lines.push(`[${w.title}]`)
     if (body) {
@@ -530,9 +798,330 @@ function splitCombinedMemoText(text, windows) {
   return { windowTexts }
 }
 
+function genRightMemoDocId() {
+  try {
+    if (globalThis.crypto?.randomUUID) {
+      return `rmd-${globalThis.crypto.randomUUID()}`
+    }
+  } catch (error) {
+    void error
+  }
+  return `rmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function hashStableMemoDocSeed(value = "") {
+  let hash = 0
+  const text = String(value ?? "")
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0
+  }
+  return hash.toString(16)
+}
+
+function getStableRightMemoDocId(input = {}, index = 0) {
+  const title = normalizeRightMemoDocTitle(input?.title, getRightMemoFallbackTitle(index))
+  const content = String(input?.content ?? "")
+  return `rmd-stable-${index}-${hashStableMemoDocSeed(`${title}\u241f${content}`)}`
+}
+
+function normalizeRightMemoDocTitle(value, fallback = "") {
+  return typeof value === "string" ? value : fallback
+}
+
+function buildUntitledRightMemoDocTitle(sequence = 1) {
+  const nextSequence = Number(sequence)
+  if (!Number.isFinite(nextSequence) || nextSequence <= 1) return UNTITLED_RIGHT_MEMO_DOC_TITLE
+  return `${UNTITLED_RIGHT_MEMO_DOC_TITLE} ${Math.floor(nextSequence)}`
+}
+
+function parseUntitledRightMemoDocSequence(title) {
+  const trimmed = String(title ?? "").trim()
+  if (!trimmed) return null
+  if (trimmed === UNTITLED_RIGHT_MEMO_DOC_TITLE) return 1
+  let match = trimmed.match(/^새 메모\s+(\d+)$/)
+  if (match) {
+    const sequence = Number(match[1] ?? NaN)
+    return Number.isFinite(sequence) && sequence >= 2 ? sequence : 1
+  }
+  match = trimmed.match(/^메모\s+(\d+)$/)
+  if (match) {
+    const sequence = Number(match[1] ?? NaN)
+    return Number.isFinite(sequence) && sequence >= 2 ? sequence : 2
+  }
+  return null
+}
+
+function getRightMemoFallbackTitle(index = 0) {
+  return index === 0 ? DEFAULT_RIGHT_MEMO_DOC_TITLE : buildUntitledRightMemoDocTitle(index)
+}
+
+function getRightMemoDocDisplayTitle(title, index = 0) {
+  const next = String(title ?? "").trim()
+  return next || getRightMemoFallbackTitle(index)
+}
+
+function createRightMemoDoc(input = {}) {
+  if (typeof input === "string") {
+    return {
+      id: genRightMemoDocId(),
+      title: normalizeRightMemoDocTitle(input, UNTITLED_RIGHT_MEMO_DOC_TITLE),
+      content: ""
+    }
+  }
+  return {
+    id: genRightMemoDocId(),
+    title: normalizeRightMemoDocTitle(input?.title, UNTITLED_RIGHT_MEMO_DOC_TITLE),
+    content: String(input?.content ?? "")
+  }
+}
+
+function normalizeRightMemoDoc(doc, index = 0) {
+  return {
+    id: typeof doc?.id === "string" && doc.id.trim() ? doc.id : getStableRightMemoDocId(doc, index),
+    title: normalizeRightMemoDocTitle(doc?.title, getRightMemoFallbackTitle(index)),
+    content: String(doc?.content ?? "")
+  }
+}
+
+function buildSafeRightMemoDocs(rawDocs) {
+  const docs = Array.isArray(rawDocs) ? rawDocs.map((doc, index) => normalizeRightMemoDoc(doc, index)) : []
+  return docs.length > 0 ? docs : [normalizeRightMemoDoc({}, 0)]
+}
+
+function parseLegacyCombinedRightMemo(rawContent) {
+  const raw = String(rawContent ?? "")
+  const lines = raw.split("\n")
+  const docs = []
+  const leadingLines = []
+  let currentTitle = null
+  let currentLines = []
+
+  function pushCurrent() {
+    if (!currentTitle) return
+    docs.push({
+      title: currentTitle,
+      content: currentLines.join("\n").trimEnd()
+    })
+  }
+
+  for (const line of lines) {
+    const trimmed = String(line ?? "").trim()
+    const match =
+      trimmed.match(/^《\s*(.+?)\s*》$/) ||
+      trimmed.match(/^〈\s*(.+?)\s*〉$/) ||
+      trimmed.match(/^「\s*(.+?)\s*」$/) ||
+      trimmed.match(/^<\s*(.+?)\s*>$/)
+
+    if (match) {
+      pushCurrent()
+      currentTitle = String(match[1] ?? "").trim() || UNTITLED_RIGHT_MEMO_DOC_TITLE
+      currentLines = []
+      continue
+    }
+
+    if (currentTitle) currentLines.push(line)
+    else leadingLines.push(line)
+  }
+
+  pushCurrent()
+
+  const leadingContent = leadingLines.join("\n").trim()
+  if (leadingContent) {
+    docs.unshift({
+      title: DEFAULT_RIGHT_MEMO_DOC_TITLE,
+      content: leadingLines.join("\n").trimEnd()
+    })
+  }
+
+  return docs.length > 0 ? docs : null
+}
+
+function normalizeRightMemoDocState(rawContent) {
+  const raw = String(rawContent ?? "")
+
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.docs)) {
+      const docs = buildSafeRightMemoDocs(parsed.docs)
+      const activeDocId =
+        typeof parsed.activeDocId === "string" && docs.some((doc) => doc.id === parsed.activeDocId)
+          ? parsed.activeDocId
+          : docs[0]?.id ?? null
+      return { docs, activeDocId }
+    }
+  } catch (error) {
+    void error
+  }
+
+  const legacyDocs = parseLegacyCombinedRightMemo(raw)
+  if (legacyDocs) {
+    const docs = buildSafeRightMemoDocs(legacyDocs)
+    return {
+      docs,
+      activeDocId: docs[0]?.id ?? null
+    }
+  }
+
+  return {
+    docs: [normalizeRightMemoDoc({ title: DEFAULT_RIGHT_MEMO_DOC_TITLE, content: raw }, 0)],
+    activeDocId: null
+  }
+}
+
+function serializeRightMemoDocState(state) {
+  const docs = buildSafeRightMemoDocs(state?.docs)
+  const activeDocId =
+    typeof state?.activeDocId === "string" && docs.some((doc) => doc.id === state.activeDocId)
+      ? state.activeDocId
+      : docs[0]?.id ?? null
+
+  return JSON.stringify({
+    version: 1,
+    activeDocId,
+    docs: docs.map((doc) => ({
+      id: doc.id,
+      title: normalizeRightMemoDocTitle(doc.title),
+      content: String(doc.content ?? "")
+    }))
+  })
+}
+
+function getNextRightMemoDocTitle(docs) {
+  const used = new Set(
+    (docs ?? [])
+      .map((doc, index) => parseUntitledRightMemoDocSequence(getRightMemoDocDisplayTitle(doc?.title, index)))
+      .filter((value) => value != null)
+  )
+  if (!used.has(1)) return buildUntitledRightMemoDocTitle(1)
+  let n = 2
+  while (used.has(n)) n += 1
+  return buildUntitledRightMemoDocTitle(n)
+}
+
+function buildRightMemoCombinedText(rawContent) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docsWithContent = state.docs.filter((doc) => String(doc?.content ?? "").trim() !== "")
+  if (docsWithContent.length === 0) return ""
+  if (
+    docsWithContent.length === 1 &&
+    getRightMemoDocDisplayTitle(docsWithContent[0]?.title, 0) === DEFAULT_RIGHT_MEMO_DOC_TITLE
+  ) {
+    return String(docsWithContent[0]?.content ?? "").trimEnd()
+  }
+  const lines = []
+  for (const [index, doc] of docsWithContent.entries()) {
+    if (index > 0) lines.push("")
+    lines.push(`《${getRightMemoDocDisplayTitle(doc?.title, index)}》`)
+    lines.push(...String(doc?.content ?? "").split("\n"))
+  }
+  return lines.join("\n").trimEnd()
+}
+
+function hasPersistableRightMemoState(rawContent) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docs = buildSafeRightMemoDocs(state.docs)
+  if (docs.length > 1) return true
+  const firstDoc = docs[0]
+  if (!firstDoc) return false
+  if (String(firstDoc?.content ?? "").trim()) return true
+  const title = String(firstDoc?.title ?? "").trim()
+  return title !== "" && title !== getRightMemoFallbackTitle(0)
+}
+
+function buildRightMemoDocView(rawContent, selectedDocId = null) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docs = buildSafeRightMemoDocs(state.docs)
+  const activeDocId =
+    typeof selectedDocId === "string" && docs.some((doc) => doc.id === selectedDocId)
+      ? selectedDocId
+      : typeof state.activeDocId === "string" && docs.some((doc) => doc.id === state.activeDocId)
+        ? state.activeDocId
+        : docs[0]?.id ?? null
+  const activeIndex = Math.max(
+    0,
+    docs.findIndex((doc) => doc.id === activeDocId)
+  )
+  return {
+    state,
+    docs,
+    activeDocId,
+    activeIndex,
+    activeDoc: docs[activeIndex] ?? docs[0] ?? createRightMemoDoc()
+  }
+}
+
+function updateRightMemoRawForDocContent(rawContent, docId, nextContent) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docs = buildSafeRightMemoDocs(state.docs).map((doc) =>
+    doc.id === docId ? { ...doc, content: String(nextContent ?? "") } : doc
+  )
+  return serializeRightMemoDocState({
+    docs,
+    activeDocId:
+      typeof docId === "string" && docs.some((doc) => doc.id === docId)
+        ? docId
+        : state.activeDocId
+  })
+}
+
+function updateRightMemoRawForDocTitle(rawContent, docId, nextTitle) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docs = buildSafeRightMemoDocs(state.docs).map((doc) =>
+    doc.id === docId ? { ...doc, title: String(nextTitle ?? "") } : doc
+  )
+  return serializeRightMemoDocState({
+    docs,
+    activeDocId:
+      typeof docId === "string" && docs.some((doc) => doc.id === docId)
+        ? docId
+        : state.activeDocId
+  })
+}
+
+function addRightMemoDocToRaw(rawContent) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docs = buildSafeRightMemoDocs(state.docs)
+  const nextDoc = createRightMemoDoc({ title: getNextRightMemoDocTitle(docs), content: "" })
+  const nextDocs = [...docs, nextDoc]
+  return {
+    raw: serializeRightMemoDocState({ docs: nextDocs, activeDocId: nextDoc.id }),
+    docId: nextDoc.id
+  }
+}
+
+function removeRightMemoDocFromRaw(rawContent, docId) {
+  const state = normalizeRightMemoDocState(rawContent)
+  const docs = buildSafeRightMemoDocs(state.docs)
+  const targetIndex = docs.findIndex((doc) => doc.id === docId)
+  if (targetIndex < 0) {
+    return { raw: serializeRightMemoDocState(state), docId: state.activeDocId, removed: false }
+  }
+  if (docs.length <= 1) {
+    const currentDoc = docs[targetIndex] ?? docs[0] ?? createRightMemoDoc()
+    const resetDoc = {
+      ...currentDoc,
+      title: DEFAULT_RIGHT_MEMO_DOC_TITLE,
+      content: ""
+    }
+    return {
+      raw: serializeRightMemoDocState({ docs: [resetDoc], activeDocId: resetDoc.id }),
+      docId: resetDoc.id,
+      removed: true
+    }
+  }
+  const nextDocs = docs.filter((doc) => doc.id !== docId)
+  const nextIndex = Math.min(targetIndex, nextDocs.length - 1)
+  const nextDocId = nextDocs[nextIndex]?.id ?? nextDocs[0]?.id ?? null
+  return {
+    raw: serializeRightMemoDocState({ docs: nextDocs, activeDocId: nextDocId }),
+    docId: nextDocId,
+    removed: true
+  }
+}
+
 function formatLine(item) {
   const time = buildPlanTimeTextFromRow(item)
-  const text = String(item?.content ?? "").trim()
+  const text = getPlanDisplayText(item)
   return { time, text }
 }
 
@@ -557,7 +1146,7 @@ function splitTimeLabel(value) {
 }
 
 function buildWidgetLineText(row) {
-  const content = String(row?.content ?? "").trim()
+  const content = getPlanDisplayText(row)
   if (!content) return ""
   const category = String(row?.category_id ?? "").trim()
   if (!category || category === "__general__") return content
@@ -565,7 +1154,7 @@ function buildWidgetLineText(row) {
 }
 
 function buildWidgetCalendarText(row) {
-  const content = String(row?.content ?? "").trim()
+  const content = getPlanDisplayText(row)
   if (!content) return ""
   const time = buildPlanTimeTextFromRow(row)
   return [time, content].filter(Boolean).join(" ").trim()
@@ -668,24 +1257,6 @@ async function syncAndroidWidgetPayload(payload) {
   }
 }
 
-function runSwapLayoutAnimation() {
-  if (Platform.OS === "web") return
-  LayoutAnimation.configureNext({
-    duration: 90,
-    create: {
-      type: LayoutAnimation.Types.easeInEaseOut,
-      property: LayoutAnimation.Properties.opacity
-    },
-    update: {
-      type: LayoutAnimation.Types.easeInEaseOut
-    },
-    delete: {
-      type: LayoutAnimation.Types.easeInEaseOut,
-      property: LayoutAnimation.Properties.opacity
-    }
-  })
-}
-
 function isRenderablePlanRow(row) {
   if (!row || typeof row !== "object") return false
   const dateKey = String(row?.date ?? "").trim()
@@ -783,6 +1354,117 @@ function sortItemsByTimeAndOrder(items) {
       .map((entry) => entry.row)
   }
   return list
+}
+
+function dedupeRowsById(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  if (list.length <= 1) return list
+  const seen = new Set()
+  const next = []
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const row = list[i]
+    const key = String(row?.id ?? "").trim()
+    if (!key) {
+      next.push(row)
+      continue
+    }
+    if (seen.has(key)) continue
+    seen.add(key)
+    next.push(row)
+  }
+  return next.reverse()
+}
+
+function getPlanBucketKey(row) {
+  const entryMeta = getPlanEntryMeta(row?.content)
+  const isTask = entryMeta.entryType === "task"
+  const repeatMeta = normalizeRepeatMeta(row ?? {})
+  const isRecurring =
+    repeatMeta.repeatType !== "none" ||
+    Boolean(String(row?.series_id ?? row?.seriesId ?? "").trim()) ||
+    Boolean(row?.has_recurrence_hint)
+
+  if (!isTask && !isRecurring) return "plan"
+  if (!isTask && isRecurring) return "recurring-plan"
+  if (isTask && !isRecurring) return "task"
+  return "recurring-task"
+}
+
+const PLAN_BUCKET_ORDER = ["plan", "recurring-plan", "task", "recurring-task"]
+const PLAN_BUCKET_LABELS = {
+  plan: "일정",
+  "recurring-plan": "반복 일정",
+  task: "Task",
+  "recurring-task": "반복 Task"
+}
+
+function groupPlanRowsByBuckets(items) {
+  const grouped = new Map(PLAN_BUCKET_ORDER.map((key) => [key, []]))
+  for (const row of Array.isArray(items) ? items : []) {
+    const key = getPlanBucketKey(row)
+    const bucket = grouped.get(key) ?? []
+    bucket.push(row)
+    grouped.set(key, bucket)
+  }
+  return grouped
+}
+
+function orderRowsByBuckets(items) {
+  const list = Array.isArray(items) ? items : []
+  if (list.length <= 1) return list
+  const buckets = groupPlanRowsByBuckets(list)
+  return PLAN_BUCKET_ORDER.flatMap((key) => buckets.get(key) ?? [])
+}
+
+function buildPlanBucketSections(items) {
+  const buckets = groupPlanRowsByBuckets(items)
+  return PLAN_BUCKET_ORDER
+    .map((key) => ({
+      key,
+      title: PLAN_BUCKET_LABELS[key] ?? key,
+      items: (buckets.get(key) ?? []).filter((row) => hasVisiblePlanDisplayText(row))
+    }))
+    .filter((section) => section.items.length > 0)
+}
+
+function replacePlanBucketRows(items, bucketKey, nextBucketRows) {
+  const buckets = groupPlanRowsByBuckets(items)
+  buckets.set(bucketKey, Array.isArray(nextBucketRows) ? nextBucketRows : [])
+  return PLAN_BUCKET_ORDER.flatMap((key) => buckets.get(key) ?? [])
+}
+
+function buildTaskOrderedRows(items) {
+  return orderRowsByBuckets(items)
+}
+
+function buildTaskGroupedListRows(items, dateKey = "", options = {}) {
+  const { showBucketDividers = true } = options ?? {}
+  const list = buildTaskOrderedRows(items)
+  if (list.length <= 1) return list
+  const sections = buildPlanBucketSections(list)
+  if (sections.length <= 1) return list
+  const rows = []
+  for (let index = 0; index < sections.length; index += 1) {
+    const section = sections[index]
+    if (index > 0) {
+      if (section.key === "task") {
+        rows.push({
+          id: `__task-divider__-${String(dateKey ?? "").trim() || "section"}`,
+          __taskDivider: true,
+          date: String(dateKey ?? "").trim()
+        })
+      } else if (showBucketDividers && (section.key === "recurring-plan" || section.key === "recurring-task")) {
+        rows.push({
+          id: `__bucket-divider__-${String(dateKey ?? "").trim() || "section"}-${section.key}`,
+          __bucketDivider: true,
+          date: String(dateKey ?? "").trim(),
+          bucketKey: section.key
+        })
+      }
+    }
+    rows.push(...section.items)
+  }
+  return rows
 }
 
 function diffDays(a, b) {
@@ -903,6 +1585,9 @@ function buildPlanEditorSnapshot({
   time = "",
   endTime = "",
   content = "",
+  entryType = "plan",
+  taskCompleted = false,
+  ddayEnabled = false,
   category = "__general__",
   alarmEnabled = true,
   alarmLeadMinutes = 0,
@@ -912,6 +1597,7 @@ function buildPlanEditorSnapshot({
   repeatUntil = ""
 }) {
   const normalizedRepeatType = normalizeRepeatType(repeatType)
+  const normalizedEntryType = normalizePlanEntryType(entryType)
   const normalizedRepeatInterval =
     normalizedRepeatType === "none" ? 1 : normalizeRepeatInterval(repeatInterval)
   const normalizedTime = normalizeClockTime(time)
@@ -923,6 +1609,9 @@ function buildPlanEditorSnapshot({
     time: normalizedTime,
     endTime: normalizedEndTime,
     content: String(content ?? "").trim(),
+    entryType: normalizedEntryType,
+    taskCompleted: normalizedEntryType === "task" ? Boolean(taskCompleted) : false,
+    ddayEnabled: Boolean(ddayEnabled),
     category: String(category ?? "__general__") || "__general__",
     alarmEnabled: normalizedAlarmEnabled,
     alarmLeadMinutes: normalizedAlarmEnabled ? normalizeAlarmLeadMinutes(alarmLeadMinutes) : 0,
@@ -931,6 +1620,118 @@ function buildPlanEditorSnapshot({
     repeatDays: normalizedRepeatType === "weekly" ? normalizeRepeatDays(repeatDays) : [],
     repeatUntil: normalizedRepeatType === "none" ? "" : String(repeatUntil ?? "").trim()
   }
+}
+
+function InlineMiniToggle({
+  value = false,
+  onToggle,
+  isDark = false,
+  trackColorOn = "#bfdbfe",
+  trackColorOff = "#d6dbe6",
+  thumbColorOn = ACCENT_BLUE,
+  thumbColorOff = "#ffffff",
+  accessibilityLabel
+}) {
+  return (
+    <Pressable
+      accessibilityRole="switch"
+      accessibilityState={{ checked: Boolean(value) }}
+      accessibilityLabel={accessibilityLabel}
+      hitSlop={6}
+      onPress={() => onToggle?.(!value)}
+      style={[
+        styles.editorInlineToggle,
+        isDark ? styles.editorInlineToggleDark : null,
+        {
+          backgroundColor: value ? trackColorOn : trackColorOff,
+          alignItems: value ? "flex-end" : "flex-start"
+        }
+      ]}
+    >
+      <View
+        style={[
+          styles.editorInlineToggleThumb,
+          isDark ? styles.editorInlineToggleThumbDark : null,
+          { backgroundColor: value ? thumbColorOn : thumbColorOff }
+        ]}
+      />
+    </Pressable>
+  )
+}
+
+function HeaderQuickSheet({ visible, title, hint = "", actions = [], tone = "light", onClose }) {
+  const isDark = tone === "dark"
+  const insets = useSafeAreaInsets()
+  const sheetBottomInset = useMemo(
+    () => (Platform.OS === "android" ? Math.max(insets.bottom, 16) : Math.max(insets.bottom, 22)),
+    [insets.bottom]
+  )
+  const actionList = useMemo(() => (Array.isArray(actions) ? actions.filter(Boolean) : []), [actions])
+
+  return (
+    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.sheetOverlay}>
+        <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+        <View
+          style={[
+            styles.sheetCard,
+            styles.headerQuickSheetCard,
+            isDark ? styles.sheetCardDark : null,
+            { marginBottom: sheetBottomInset }
+          ]}
+        >
+          <View style={styles.sheetHeader}>
+            <View style={styles.tasksSheetHeaderCopy}>
+              <Text style={[styles.sheetTitle, isDark ? styles.textDark : null]}>{title}</Text>
+              {hint ? <Text style={[styles.tasksSheetHint, isDark ? styles.textMutedDark : null]}>{hint}</Text> : null}
+            </View>
+            <View style={styles.sheetHeaderRight}>
+              <Pressable onPress={onClose} style={[styles.sheetBtnGhost, isDark ? styles.sheetBtnGhostDark : null]}>
+                <Text style={[styles.sheetBtnGhostText, isDark ? styles.textDark : null]}>닫기</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View style={styles.headerQuickActions}>
+            {actionList.map((action) => (
+              <Pressable
+                key={action.key}
+                onPress={() => {
+                  onClose?.()
+                  requestAnimationFrame(() => action.onPress?.())
+                }}
+                style={[
+                  styles.headerQuickAction,
+                  isDark ? styles.headerQuickActionDark : null,
+                  action.danger ? styles.headerQuickActionDanger : null
+                ]}
+              >
+                <View style={styles.headerQuickActionCopy}>
+                  <Text
+                    style={[
+                      styles.headerQuickActionTitle,
+                      isDark ? styles.textDark : null,
+                      action.danger ? styles.headerQuickActionTitleDanger : null
+                    ]}
+                  >
+                    {action.label}
+                  </Text>
+                  {action.description ? (
+                    <Text style={[styles.headerQuickActionHint, isDark ? styles.textMutedDark : null]}>{action.description}</Text>
+                  ) : null}
+                </View>
+                {action.badge ? (
+                  <View style={[styles.headerQuickActionBadge, isDark ? styles.headerQuickActionBadgeDark : null]}>
+                    <Text style={styles.headerQuickActionBadgeText}>{action.badge}</Text>
+                  </View>
+                ) : null}
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
 }
 
 function LogoMark({ tone = "light", size = 38 }) {
@@ -957,6 +1758,10 @@ function Header({
   subtitle,
   loading,
   onSignOut,
+  onTasks,
+  onDdays,
+  tasksCount = 0,
+  ddayCount = 0,
   todayLabel,
   onToday,
   onFilter,
@@ -968,72 +1773,128 @@ function Header({
 }) {
   const isDark = tone === "dark"
   const hasSubtitle = String(subtitle ?? "").trim().length > 0
+  const [collectionMenuVisible, setCollectionMenuVisible] = useState(false)
+  const hasCollectionMenu = Boolean(onTasks || onDdays)
+  const collectionCount = Math.max(0, Number(tasksCount || 0)) + Math.max(0, Number(ddayCount || 0))
+  const collectionActions = useMemo(
+    () => [
+      onTasks
+        ? {
+            key: "tasks",
+            label: "Task",
+            description: tasksCount > 0 ? `완료 전 Task ${tasksCount}개` : "Task 항목을 모아서 봅니다.",
+            badge: tasksCount > 0 ? (tasksCount > 99 ? "99+" : String(tasksCount)) : "",
+            onPress: onTasks
+          }
+        : null,
+      onDdays
+        ? {
+            key: "ddays",
+            label: "D-day",
+            description: ddayCount > 0 ? `다가오는 D-day ${ddayCount}개` : "D-day 항목을 모아서 봅니다.",
+            badge: ddayCount > 0 ? (ddayCount > 99 ? "99+" : String(ddayCount)) : "",
+            onPress: onDdays
+          }
+        : null
+    ],
+    [onTasks, onDdays, tasksCount, ddayCount]
+  )
+  const HeaderLeftTag = onToday ? Pressable : View
+
   return (
-    <View style={[styles.header, isDark ? styles.headerDark : null]}>
-      <View style={styles.headerLeft}>
-        {hasSubtitle ? (
-          <>
-            {showLogo ? <LogoMark tone={tone} size={38} /> : null}
-            <View style={!showLogo ? styles.headerTitleWrapNoLogo : null}>
-              <Text
-                style={[
-                  styles.title,
-                  isDark ? styles.titleDark : null,
-                  titleStyle,
-                  !showLogo ? styles.headerTitleTranslateDown : null
-                ]}
-              >
-                {title}
-              </Text>
-              <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>{subtitle}</Text>
+    <>
+      <View style={[styles.header, isDark ? styles.headerDark : null]}>
+        <HeaderLeftTag
+          style={[styles.headerLeft, onToday ? styles.headerLeftPressable : null]}
+          onPress={onToday ?? undefined}
+          accessibilityRole={onToday ? "button" : undefined}
+          accessibilityLabel={onToday ? "오늘로 이동" : undefined}
+        >
+          {hasSubtitle ? (
+            <>
+              {showLogo ? <LogoMark tone={tone} size={38} /> : null}
+              <View style={!showLogo ? styles.headerTitleWrapNoLogo : null}>
+                <Text
+                  style={[
+                    styles.title,
+                    isDark ? styles.titleDark : null,
+                    titleStyle,
+                    !showLogo ? styles.headerTitleTranslateDown : null
+                  ]}
+                >
+                  {title}
+                </Text>
+                <Text style={[styles.subtitle, isDark ? styles.subtitleDark : null]}>{subtitle}</Text>
+              </View>
+            </>
+          ) : (
+            <View style={[!showLogo ? styles.headerBrandOnlyWrap : null, buttonsStyle]}>
+              <View style={styles.headerBrandOnlyLogoBoost}>
+                <LogoMark tone={tone} size={38} />
+              </View>
             </View>
-          </>
-        ) : (
-          <View style={[!showLogo ? styles.headerBrandOnlyWrap : null, buttonsStyle]}>
-            <View style={styles.headerBrandOnlyLogoBoost}>
-              <LogoMark tone={tone} size={38} />
-            </View>
-          </View>
-        )}
+          )}
+        </HeaderLeftTag>
+        <View style={[styles.headerButtons, buttonsStyle]}>
+          {onToday && todayLabel ? (
+            <TouchableOpacity
+              style={[
+                styles.headerTodayButton,
+                styles.headerTasksButtonActive,
+                isDark ? styles.headerTasksButtonActiveDark : null
+              ]}
+              onPress={onToday}
+              accessibilityRole="button"
+              accessibilityLabel="Today"
+            >
+              <Text style={[styles.headerTodayText, isDark ? styles.headerTodayTextDark : null]}>{todayLabel}</Text>
+            </TouchableOpacity>
+          ) : null}
+          {hasCollectionMenu ? (
+            <TouchableOpacity
+              style={[
+                styles.headerTasksButton,
+                isDark ? styles.ghostButtonDark : null,
+                collectionCount > 0 ? styles.headerTasksButtonActive : null,
+                collectionCount > 0 && isDark ? styles.headerTasksButtonActiveDark : null
+              ]}
+              onPress={() => setCollectionMenuVisible(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Task와 D-day 모아보기"
+            >
+              <Text style={[styles.headerTasksText, styles.headerTasksIconText, isDark ? styles.ghostButtonTextDark : null]}>✓</Text>
+              {collectionCount > 0 ? (
+                <View style={[styles.headerTasksBadge, isDark ? styles.headerTasksBadgeDark : null]}>
+                  <Text style={styles.headerTasksBadgeText}>{collectionCount > 99 ? "99+" : String(collectionCount)}</Text>
+                </View>
+              ) : null}
+            </TouchableOpacity>
+          ) : null}
+          {onSignOut ? (
+            <TouchableOpacity
+              style={[
+                styles.headerTasksButton,
+                styles.headerTasksButtonActive,
+                isDark ? styles.headerTasksButtonActiveDark : null
+              ]}
+              onPress={onSignOut}
+              accessibilityRole="button"
+              accessibilityLabel="Settings"
+            >
+              <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>{"\u2699"}</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
       </View>
-      <View style={[styles.headerButtons, buttonsStyle]}>
-        {onToday && todayLabel ? (
-          <TouchableOpacity
-            style={[styles.headerTodayButton, isDark ? styles.ghostButtonDark : null]}
-            onPress={onToday}
-            accessibilityRole="button"
-            accessibilityLabel="Today"
-          >
-            <Text style={[styles.headerTodayText, isDark ? styles.headerTodayTextDark : null]}>{todayLabel}</Text>
-          </TouchableOpacity>
-        ) : null}
-        {onFilter ? (
-          <TouchableOpacity
-            style={[styles.headerFilterButton, isDark ? styles.ghostButtonDark : null]}
-            onPress={onFilter}
-            accessibilityRole="button"
-            accessibilityLabel="Filter"
-          >
-            <Image
-              source={require("./assets/filter.png")}
-              style={[styles.headerFilterIconImg, isDark ? styles.headerFilterIconImgDark : null]}
-              resizeMode="contain"
-            />
-            {filterActive ? <View style={styles.headerFilterActiveDot} /> : null}
-          </TouchableOpacity>
-        ) : null}
-        {onSignOut ? (
-          <TouchableOpacity
-            style={[styles.ghostButton, isDark ? styles.ghostButtonDark : null]}
-            onPress={onSignOut}
-            accessibilityRole="button"
-            accessibilityLabel="Settings"
-          >
-            <Text style={[styles.ghostButtonText, isDark ? styles.ghostButtonTextDark : null]}>{"\u2699"}</Text>
-          </TouchableOpacity>
-        ) : null}
-      </View>
-    </View>
+      <HeaderQuickSheet
+        visible={collectionMenuVisible}
+        title="체크"
+        hint="Task와 D-day를 한곳에서 열어볼 수 있습니다."
+        actions={collectionActions}
+        tone={tone}
+        onClose={() => setCollectionMenuVisible(false)}
+      />
+    </>
   )
 }
 
@@ -1175,6 +2036,210 @@ function SettingsSheet({ visible, themeMode, fontScale, onChangeTheme, onChangeF
   )
 }
 
+function TasksSheet({ visible, tone = "light", tasks = [], onToggleTask, onOpenTask, onClose }) {
+  const isDark = tone === "dark"
+  const insets = useSafeAreaInsets()
+  const sheetBottomInset = useMemo(
+    () => (Platform.OS === "android" ? Math.max(insets.bottom, 16) : Math.max(insets.bottom, 22)),
+    [insets.bottom]
+  )
+  const taskList = useMemo(() => (Array.isArray(tasks) ? tasks : []), [tasks])
+
+  function renderTaskItem(item) {
+    const completed = Boolean(item?.completed)
+    return (
+      <View key={item?.id} style={[styles.tasksSheetItem, isDark ? styles.tasksSheetItemDark : null]}>
+        <Pressable
+          onPress={() => onToggleTask?.(item)}
+          style={[
+            styles.tasksSheetCheck,
+            completed ? styles.tasksSheetCheckActive : null,
+            isDark ? styles.tasksSheetCheckDark : null,
+            completed && isDark ? styles.tasksSheetCheckActiveDark : null
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel={completed ? "완료 해제" : "완료"}
+        >
+          <Text style={[styles.tasksSheetCheckText, completed ? styles.tasksSheetCheckTextActive : null]}>
+            {completed ? "✓" : ""}
+          </Text>
+        </Pressable>
+        <Pressable onPress={() => onOpenTask?.(item)} style={styles.tasksSheetItemBody}>
+          <View style={styles.tasksSheetTitleRow}>
+            {item?.repeatLabel ? (
+              <View style={[styles.tasksSheetMetaPill, isDark ? styles.tasksSheetMetaPillDark : null]}>
+                <Text style={[styles.tasksSheetMetaPillText, isDark ? styles.textMutedDark : null]}>{item.repeatLabel}</Text>
+              </View>
+            ) : null}
+            <Text
+              style={[
+                styles.tasksSheetItemTitle,
+                isDark ? styles.textDark : null,
+                completed ? styles.tasksSheetItemTitleDone : null
+              ]}
+            >
+              {item?.display}
+            </Text>
+          </View>
+          <View style={styles.tasksSheetMetaRow}>
+            <Text style={[styles.tasksSheetMetaText, isDark ? styles.textMutedDark : null]}>{item?.dateKey}</Text>
+            {item?.time ? (
+              <Text style={[styles.tasksSheetMetaText, isDark ? styles.textMutedDark : null]}>{item.time}</Text>
+            ) : null}
+            {item?.title ? (
+              <Text style={[styles.tasksSheetMetaText, isDark ? styles.textMutedDark : null]}>{`[${item.title}]`}</Text>
+            ) : null}
+          </View>
+        </Pressable>
+      </View>
+    )
+  }
+
+  return (
+    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.sheetOverlay}>
+        <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+        <View
+          style={[
+            styles.sheetCard,
+            styles.tasksSheetCard,
+            isDark ? styles.sheetCardDark : null,
+            { marginBottom: sheetBottomInset }
+          ]}
+        >
+          <View style={styles.sheetHeader}>
+            <View style={styles.tasksSheetHeaderCopy}>
+              <Text style={[styles.sheetTitle, isDark ? styles.textDark : null]}>Task</Text>
+              <Text style={[styles.tasksSheetHint, isDark ? styles.textMutedDark : null]}>
+                {taskList.length > 0
+                  ? `Task ${taskList.length}개`
+                  : "일정 편집 화면에서 Task를 선택하면 여기서 모아볼 수 있습니다."}
+              </Text>
+            </View>
+            <View style={styles.sheetHeaderRight}>
+              <Pressable onPress={onClose} style={[styles.sheetBtnGhost, isDark ? styles.sheetBtnGhostDark : null]}>
+                <Text style={[styles.sheetBtnGhostText, isDark ? styles.textDark : null]}>닫기</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <ScrollView style={styles.tasksSheetScroll} contentContainerStyle={styles.tasksSheetContent}>
+            {taskList.length ? (
+              <View style={styles.tasksSheetSection}>
+                <View style={styles.tasksSheetSectionHeader}>
+                  <Text style={[styles.tasksSheetSectionTitle, isDark ? styles.textDark : null]}>Tasks</Text>
+                </View>
+                {taskList.map(renderTaskItem)}
+              </View>
+            ) : null}
+
+            {taskList.length === 0 ? (
+              <View style={[styles.tasksSheetEmpty, isDark ? styles.tasksSheetEmptyDark : null]}>
+                <Text style={[styles.tasksSheetEmptyTitle, isDark ? styles.textDark : null]}>표시할 항목이 없습니다.</Text>
+                <Text style={[styles.tasksSheetEmptyText, isDark ? styles.textMutedDark : null]}>
+                  일정 추가/수정 화면에서 Task를 선택하세요.
+                </Text>
+              </View>
+            ) : null}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
+function DdaySheet({ visible, tone = "light", items = [], onOpenItem, onClose }) {
+  const isDark = tone === "dark"
+  const insets = useSafeAreaInsets()
+  const sheetBottomInset = useMemo(
+    () => (Platform.OS === "android" ? Math.max(insets.bottom, 16) : Math.max(insets.bottom, 22)),
+    [insets.bottom]
+  )
+  const ddayList = useMemo(() => (Array.isArray(items) ? items : []), [items])
+
+  function renderDdayItem(item) {
+    return (
+      <Pressable
+        key={item?.id}
+        onPress={() => onOpenItem?.(item)}
+        style={[styles.tasksSheetItem, isDark ? styles.tasksSheetItemDark : null]}
+      >
+        <View style={[styles.tasksSheetDdayBadge, isDark ? styles.tasksSheetDdayBadgeDark : null]}>
+          <Text style={styles.tasksSheetDdayBadgeText}>{item?.ddayLabel}</Text>
+        </View>
+        <View style={styles.tasksSheetItemBody}>
+          <View style={styles.tasksSheetTitleRow}>
+            {item?.repeatLabel ? (
+              <View style={[styles.tasksSheetMetaPill, isDark ? styles.tasksSheetMetaPillDark : null]}>
+                <Text style={[styles.tasksSheetMetaPillText, isDark ? styles.textMutedDark : null]}>{item.repeatLabel}</Text>
+              </View>
+            ) : null}
+            <Text style={[styles.tasksSheetItemTitle, isDark ? styles.textDark : null]}>{item?.display}</Text>
+          </View>
+          <View style={styles.tasksSheetMetaRow}>
+            <Text style={[styles.tasksSheetMetaText, isDark ? styles.textMutedDark : null]}>{item?.shortDateLabel}</Text>
+            {item?.time ? (
+              <Text style={[styles.tasksSheetMetaText, isDark ? styles.textMutedDark : null]}>{item.time}</Text>
+            ) : null}
+            {item?.title ? (
+              <Text style={[styles.tasksSheetMetaText, isDark ? styles.textMutedDark : null]}>{`[${item.title}]`}</Text>
+            ) : null}
+          </View>
+        </View>
+      </Pressable>
+    )
+  }
+
+  return (
+    <Modal transparent animationType="fade" visible={visible} statusBarTranslucent onRequestClose={onClose}>
+      <View style={styles.sheetOverlay}>
+        <Pressable style={styles.sheetBackdrop} onPress={onClose} />
+        <View
+          style={[
+            styles.sheetCard,
+            styles.tasksSheetCard,
+            isDark ? styles.sheetCardDark : null,
+            { marginBottom: sheetBottomInset }
+          ]}
+        >
+          <View style={styles.sheetHeader}>
+            <View style={styles.tasksSheetHeaderCopy}>
+              <Text style={[styles.sheetTitle, isDark ? styles.textDark : null]}>D-day</Text>
+              <Text style={[styles.tasksSheetHint, isDark ? styles.textMutedDark : null]}>
+                {ddayList.length > 0
+                  ? `D-day ${ddayList.length}개`
+                  : "일정 편집 화면에서 D-day를 켜면 여기서 모아볼 수 있습니다."}
+              </Text>
+            </View>
+            <View style={styles.sheetHeaderRight}>
+              <Pressable onPress={onClose} style={[styles.sheetBtnGhost, isDark ? styles.sheetBtnGhostDark : null]}>
+                <Text style={[styles.sheetBtnGhostText, isDark ? styles.textDark : null]}>닫기</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <ScrollView style={styles.tasksSheetScroll} contentContainerStyle={styles.tasksSheetContent}>
+            {ddayList.length ? (
+              <View style={styles.tasksSheetSection}>
+                {ddayList.map(renderDdayItem)}
+              </View>
+            ) : null}
+
+            {ddayList.length === 0 ? (
+              <View style={[styles.tasksSheetEmpty, isDark ? styles.tasksSheetEmptyDark : null]}>
+                <Text style={[styles.tasksSheetEmptyTitle, isDark ? styles.textDark : null]}>표시할 항목이 없습니다.</Text>
+                <Text style={[styles.tasksSheetEmptyText, isDark ? styles.textMutedDark : null]}>
+                  일정 추가/수정 화면에서 D-day를 켜세요.
+                </Text>
+              </View>
+            ) : null}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
 function WindowTabs({
   windows,
   activeId,
@@ -1236,6 +2301,7 @@ function WindowTabs({
 
   useEffect(() => {
     if (Platform.OS !== "android") return
+    if (global?.nativeFabricUIManager) return
     if (typeof UIManager?.setLayoutAnimationEnabledExperimental !== "function") return
     UIManager.setLayoutAnimationEnabledExperimental(true)
   }, [])
@@ -1757,7 +2823,12 @@ function ListScreen({
   onAddPlan,
   onEditPlan,
   onReorderNoTime,
-  onQuickDeletePlan
+  onQuickDeletePlan,
+  onTasks,
+  tasksCount = 0,
+  onDdays,
+  ddayCount = 0,
+  onToggleTask
 }) {
   const scale = useMemo(() => {
     const n = Number(fontScale)
@@ -1777,6 +2848,7 @@ function ListScreen({
   const monthLabel = `${viewYear}-${pad2(viewMonth)}`
   const todayKey = dateToKey(todayYear, todayMonth, todayDate)
   const todayLabel = `${todayMonth}/${todayDate}`
+  const headerSubtitle = formatTodayHeaderText(today)
   const defaultAddDateKey = useMemo(() => {
     const isCurrentMonth = viewYear === todayYear && viewMonth === todayMonth
     return isCurrentMonth ? todayKey : dateToKey(viewYear, viewMonth, 1)
@@ -1793,10 +2865,6 @@ function ListScreen({
   const reorderOriginalIdsRef = useRef([])
   const [reorderSaving, setReorderSaving] = useState(false)
   const [draggingId, setDraggingId] = useState(null)
-  const dragY = useRef(new Animated.Value(0)).current
-  const noTimeLayoutsRef = useRef({})
-  const dragStateRef = useRef({ activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 })
-  const pendingAutoDragIdRef = useRef("")
   const suppressPressRef = useRef(false)
 
   const colorByTitle = useMemo(() => {
@@ -1835,6 +2903,8 @@ function ListScreen({
     reorderItemsRef.current = reorderItems
   }, [reorderItems])
 
+  const reorderBucketSections = useMemo(() => buildPlanBucketSections(reorderItems), [reorderItems])
+
   const getAllItemsForDate = useCallback(
     (dateKey) => {
       const key = String(dateKey ?? "").trim()
@@ -1872,19 +2942,16 @@ function ListScreen({
     if (!onReorderNoTime) return
     const key = String(dateKey ?? "").trim()
     if (!key) return
-    const rawItems = Array.isArray(sourceItems) ? sourceItems : getAllItemsForDate(key)
-    const items = sortItemsByTimeAndOrder(rawItems)
+    const rawItems = (Array.isArray(sourceItems) ? sourceItems : getAllItemsForDate(key)).filter((row) => isRenderablePlanRow(row))
+    const items = buildTaskOrderedRows(sortItemsByTimeAndOrder(rawItems))
     setReorderState({ visible: true, dateKey: key })
     setReorderItems(items)
     reorderItemsRef.current = items
     reorderOriginalIdsRef.current = items
       .map((item) => String(item?.id ?? "").trim())
       .filter(Boolean)
-    noTimeLayoutsRef.current = {}
-    dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
     setDraggingId(null)
     setReorderSaving(false)
-    dragY.setValue(0)
   }
 
   function closeReorderModal() {
@@ -1892,112 +2959,10 @@ function ListScreen({
     setReorderItems([])
     reorderItemsRef.current = []
     reorderOriginalIdsRef.current = []
-    noTimeLayoutsRef.current = {}
-    dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-    pendingAutoDragIdRef.current = ""
     setDraggingId(null)
     setReorderSaving(false)
     suppressPressRef.current = false
-    dragY.setValue(0)
   }
-
-  function startDrag(item) {
-    if (!item) return
-    const id = String(item?.id ?? "").trim()
-    if (!id) return
-    const layout = noTimeLayoutsRef.current?.[id]
-    if (!layout) return
-    const list = reorderItemsRef.current
-    const currentIndex = Array.isArray(list) ? list.findIndex((row) => String(row?.id ?? "").trim() === id) : -1
-    if (currentIndex < 0) return
-    const startY = Number(layout.y) || 0
-    const height = Number(layout.height) || 48
-    dragStateRef.current = { activeId: id, startY, height, startIndex: currentIndex, currentIndex, lastSwapAt: 0 }
-    dragY.setValue(startY)
-    requestAnimationFrame(() => {
-      setDraggingId(id)
-    })
-  }
-
-  function finishDrag() {
-    const state = dragStateRef.current
-    if (!state.activeId) return
-    const activeId = String(state.activeId ?? "")
-    const cleanup = () => {
-      dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-      setDraggingId(null)
-    }
-
-    dragY.stopAnimation((currentY) => {
-      const rawTarget = Number(noTimeLayoutsRef.current?.[activeId]?.y ?? Number.NaN)
-      const fallback = Number.isFinite(currentY) ? currentY : Number(state.startY ?? 0)
-      const targetY = Number.isFinite(rawTarget) ? rawTarget : fallback
-      Animated.spring(dragY, {
-        toValue: targetY,
-        tension: 220,
-        friction: 22,
-        useNativeDriver: true
-      }).start(() => {
-        cleanup()
-      })
-    })
-  }
-
-  const panResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => Boolean(dragStateRef.current.activeId),
-        onStartShouldSetPanResponderCapture: () => Boolean(dragStateRef.current.activeId),
-        onMoveShouldSetPanResponder: () => Boolean(dragStateRef.current.activeId),
-        onMoveShouldSetPanResponderCapture: () => Boolean(dragStateRef.current.activeId),
-        onPanResponderMove: (_evt, gesture) => {
-          const state = dragStateRef.current
-          if (!state.activeId) return
-          const nextY = Number(state.startY ?? 0) + Number(gesture?.dy ?? 0)
-          dragY.setValue(nextY)
-          const list = reorderItemsRef.current
-          if (!Array.isArray(list) || list.length === 0) return
-          let currentIndex = Number(state.currentIndex ?? -1)
-          if (!Number.isFinite(currentIndex) || currentIndex < 0 || currentIndex >= list.length) {
-            currentIndex = list.findIndex((row) => String(row?.id ?? "") === String(state.activeId ?? ""))
-          }
-          if (currentIndex < 0) return
-          const now = Date.now()
-          if (now - Number(state.lastSwapAt ?? 0) < 16) return
-          const startIndex = Number.isFinite(Number(state.startIndex))
-            ? Number(state.startIndex)
-            : currentIndex
-          const rowHeight = Math.max(28, Number(state.height ?? 0) || 48)
-          const stepOffset = Number(gesture?.dy ?? 0) / rowHeight
-          const projected = Math.round(startIndex + stepOffset)
-          const targetIndex = clamp(projected, 0, list.length - 1)
-          if (targetIndex === currentIndex) return
-          const nextItems = moveItem(list, currentIndex, targetIndex)
-          runSwapLayoutAnimation()
-          reorderItemsRef.current = nextItems
-          dragStateRef.current = { ...state, currentIndex: targetIndex, lastSwapAt: now }
-          setReorderItems(nextItems)
-        },
-        onPanResponderRelease: () => finishDrag(),
-        onPanResponderTerminate: () => finishDrag(),
-        onPanResponderTerminationRequest: () => false
-      }),
-    []
-  )
-
-  useEffect(() => {
-    if (!reorderState.visible) return
-    const pendingId = String(pendingAutoDragIdRef.current ?? "").trim()
-    if (!pendingId) return
-    const row = reorderItems.find((item) => String(item?.id ?? "").trim() === pendingId)
-    if (!row) {
-      pendingAutoDragIdRef.current = ""
-      return
-    }
-    if (!noTimeLayoutsRef.current?.[pendingId]) return
-    pendingAutoDragIdRef.current = ""
-    startDrag(row)
-  }, [reorderState.visible, reorderItems])
 
   async function commitReorder() {
     if (reorderSaving) return
@@ -2036,11 +3001,7 @@ function ListScreen({
           reorderItemsRef.current = next
           reorderOriginalIdsRef.current = next.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
           setReorderItems(next)
-          if (draggingId && String(draggingId) === id) {
-            dragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-            setDraggingId(null)
-            dragY.setValue(0)
-          }
+          if (draggingId && String(draggingId) === id) setDraggingId(null)
           if (next.length === 0) closeReorderModal()
         }
       }
@@ -2048,7 +3009,13 @@ function ListScreen({
   }
 
   function scrollToToday() {
-    const index = visibleSections.findIndex((s) => s.title === todayKey)
+    const exactIndex = visibleSections.findIndex((s) => s.title === todayKey)
+    const nextIndex =
+      exactIndex !== -1
+        ? exactIndex
+        : visibleSections.findIndex((section) => String(section?.title ?? "") > todayKey)
+    const fallbackIndex = nextIndex !== -1 ? nextIndex : visibleSections.length > 0 ? visibleSections.length - 1 : -1
+    const index = fallbackIndex
     if (index === -1) return false
     listRef.current?.scrollToLocation?.({
       sectionIndex: index,
@@ -2160,39 +3127,31 @@ function ListScreen({
         }
         return {
           ...section,
-          data: baseData
+          data: buildTaskGroupedListRows(baseData, key)
         }
       })
       .filter((section) => (section?.data?.length ?? 0) > 0)
   }, [sections, viewYear, viewMonth, applyListFilter, reorderState])
 
-  const reorderDow = reorderState.dateKey ? weekdayLabel(reorderState.dateKey) : ""
-  const reorderDateLabel = reorderState.dateKey
-    ? `${formatDateMD(reorderState.dateKey)}${reorderDow ? ` (${reorderDow})` : ""}`
-    : ""
-  const draggingItem = reorderItems.find((item) => String(item?.id ?? "") === draggingId)
-
   function renderReorderRow(item, options = {}) {
     if (!item) return null
-    const { draggable = false, ghost = false, placeholder = false, onLayout, onLongPress, onDelete, rowKey } = options
+    const { draggable = false, isActive = false, onLongPress, onDelete, rowKey } = options
     const time = buildPlanTimeTextFromRow(item)
-    const content = String(item?.content ?? "").trim()
+    const content = getPlanDisplayText(item)
     const category = String(item?.category_id ?? "").trim()
     const isGeneral = !category || category === "__general__"
     const categoryColor = colorByTitle.get(category) || "#94a3b8"
-    const Container = draggable && !ghost ? Pressable : View
+    const Container = draggable ? Pressable : View
     return (
       <Container
         key={rowKey}
-        onLayout={onLayout}
-        onLongPress={draggable && !ghost ? onLongPress : undefined}
-        delayLongPress={draggable && !ghost ? 110 : undefined}
+        onLongPress={draggable ? onLongPress : undefined}
+        delayLongPress={draggable ? 90 : undefined}
         style={[
           styles.reorderItemRow,
           isDark ? styles.reorderItemRowDark : null,
-          ghost ? styles.reorderDragGhost : null,
-          ghost && isDark ? styles.reorderDragGhostDark : null,
-          placeholder ? styles.reorderItemPlaceholder : null
+          isActive ? styles.reorderDragGhost : null,
+          isActive && isDark ? styles.reorderDragGhostDark : null
         ]}
       >
         <View style={styles.itemLeftCol}>
@@ -2225,7 +3184,7 @@ function ListScreen({
             ) : null}
           </View>
         </View>
-        {draggable && !ghost && !placeholder ? (
+        {draggable ? (
           <Pressable
             onPress={onDelete}
             hitSlop={8}
@@ -2240,31 +3199,39 @@ function ListScreen({
 
   useEffect(() => {
     if (!pendingScrollRef.current) return
-    if (!scrollToToday()) {
-      pendingScrollRef.current = false
-      return
-    }
-    requestAnimationFrame(() => {
-      scrollToToday()
-      pendingScrollRef.current = false
-    })
-  }, [visibleSections, todayKey, scrollToken])
+    if (viewYear !== todayYear || viewMonth !== todayMonth) return
+    const timer = setTimeout(() => {
+      const didScroll = scrollToToday()
+      if (!didScroll) {
+        pendingScrollRef.current = false
+        return
+      }
+      requestAnimationFrame(() => {
+        scrollToToday()
+        pendingScrollRef.current = false
+      })
+    }, 40)
+    return () => clearTimeout(timer)
+  }, [visibleSections, todayKey, scrollToken, viewYear, viewMonth, todayYear, todayMonth])
 
   return (
-    <SafeAreaView style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
+    <SafeAreaView edges={["top", "left", "right"]} style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
       <Header
         title="Planner"
+        subtitle={headerSubtitle}
         loading={loading}
         onRefresh={onRefresh}
         onSignOut={onSignOut}
+        onTasks={onTasks}
+        tasksCount={tasksCount}
+        onDdays={onDdays}
+        ddayCount={ddayCount}
         todayLabel={todayLabel}
         onToday={goToday}
         onFilter={activeTabId === "all" ? () => setListFilterVisible(true) : null}
         filterActive={!isAllListFiltersSelected}
         tone={tone}
         showLogo={false}
-        titleStyle={styles.calendarTitleOffset}
-        buttonsStyle={styles.calendarButtonsOffset}
       />
       <WindowTabs
         windows={windows}
@@ -2279,12 +3246,20 @@ function ListScreen({
       />
       <View style={[styles.listMonthBar, isDark ? styles.listMonthBarDark : null]}>
         <View style={styles.listMonthLeftGroup}>
-          <TouchableOpacity style={styles.listMonthNavButton} onPress={goPrevMonth}>
-            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{"<"}</Text>
+          <TouchableOpacity
+            style={[styles.listMonthNavButton, isDark ? styles.listMonthNavButtonDark : null]}
+            onPress={goPrevMonth}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Text style={[styles.listMonthNavText, isDark ? styles.listMonthNavTextDark : null]}>{"‹"}</Text>
           </TouchableOpacity>
           <Text style={[styles.listMonthText, isDark ? styles.textDark : null]}>{monthLabel}</Text>
-          <TouchableOpacity style={styles.listMonthNavButton} onPress={goNextMonth}>
-            <Text style={[styles.listMonthNavText, isDark ? styles.textDark : null]}>{">"}</Text>
+          <TouchableOpacity
+            style={[styles.listMonthNavButton, isDark ? styles.listMonthNavButtonDark : null]}
+            onPress={goNextMonth}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Text style={[styles.listMonthNavText, isDark ? styles.listMonthNavTextDark : null]}>{"›"}</Text>
           </TouchableOpacity>
         </View>
         <View style={styles.listMonthRightGroup}>
@@ -2311,47 +3286,73 @@ function ListScreen({
             if (item?.__reorder) {
               return (
                 <View style={[styles.reorderInlineCard, isDark ? styles.reorderInlineCardDark : null]}>
-                  <View style={styles.reorderNoTimeList} {...panResponder.panHandlers}>
-                    {reorderItems.length ? (
-                      reorderItems.map((row) => {
-                        const rowId = String(row?.id ?? "")
-                        const rowKey = rowId || `${row?.date}-${row?.content}`
-                        const isPlaceholder = rowId && rowId === draggingId
-                        return renderReorderRow(row, {
-                          rowKey,
-                          draggable: true,
-                          placeholder: isPlaceholder,
-                          onLayout: (event) => {
-                            if (!rowId) return
-                            const layout = event?.nativeEvent?.layout
-                            if (!layout) return
-                            noTimeLayoutsRef.current[rowId] = { y: layout.y, height: layout.height }
-                          },
-                          onLongPress: () => startDrag(row),
-                          onDelete: () => quickDeleteFromReorder(row)
-                        })
-                      })
-                    ) : (
-                      <View style={styles.reorderEmpty}>
-                        <Text style={[styles.reorderEmptyText, isDark ? styles.textMutedDark : null]}>
-                          항목이 없습니다.
-                        </Text>
-                      </View>
-                    )}
-                    {draggingItem ? (
-                      <Animated.View
-                        pointerEvents="none"
-                        style={[styles.reorderDragOverlay, { transform: [{ translateY: dragY }] }]}
-                      >
-                        {renderReorderRow(draggingItem, { ghost: true })}
-                      </Animated.View>
-                    ) : null}
-                  </View>
+                  {reorderItems.length ? (
+                    <View style={styles.reorderBucketWrap}>
+                      {reorderBucketSections.map((section, sectionIndex) => (
+                        <View
+                          key={`${reorderState.dateKey}-${section.key}`}
+                          style={[styles.reorderSection, sectionIndex === 0 ? styles.reorderSectionFirst : null]}
+                        >
+                          <Text style={[styles.reorderSectionTitle, isDark ? styles.textMutedDark : null]}>{section.title}</Text>
+                          <DraggableFlatList
+                            data={section.items}
+                            keyExtractor={(row, idx) => String(row?.id ?? `${row?.date}-${row?.content}-${idx}`)}
+                            scrollEnabled={false}
+                            activationDistance={10}
+                            animationConfig={{ damping: 20, stiffness: 220, mass: 0.35 }}
+                            containerStyle={styles.reorderNoTimeList}
+                            onDragBegin={(index) => {
+                              const row = section.items?.[index]
+                              setDraggingId(String(row?.id ?? "__drag__"))
+                            }}
+                            onDragEnd={({ data }) => {
+                              const nextData = replacePlanBucketRows(reorderItemsRef.current, section.key, data)
+                              reorderItemsRef.current = nextData
+                              setReorderItems(nextData)
+                              setDraggingId(null)
+                            }}
+                            renderItem={({ item: row, drag, isActive }) =>
+                              renderReorderRow(row, {
+                                rowKey: String(row?.id ?? `${row?.date}-${row?.content}`),
+                                draggable: true,
+                                isActive,
+                                onLongPress: drag,
+                                onDelete: () => quickDeleteFromReorder(row)
+                              })
+                            }
+                          />
+                        </View>
+                      ))}
+                    </View>
+                  ) : (
+                    <View style={styles.reorderEmpty}>
+                      <Text style={[styles.reorderEmptyText, isDark ? styles.textMutedDark : null]}>
+                        항목이 없습니다.
+                      </Text>
+                    </View>
+                  )}
+                </View>
+              )
+            }
+            if (item?.__taskDivider) {
+              return (
+                <View style={styles.itemTaskDividerRow}>
+                  <View style={[styles.itemTaskDividerLine, isDark ? styles.itemTaskDividerLineDark : null]} />
+                </View>
+              )
+            }
+            if (item?.__bucketDivider) {
+              return (
+                <View style={styles.itemBucketDividerRow}>
+                  <View style={[styles.itemBucketDividerLine, isDark ? styles.itemBucketDividerLineDark : null]} />
                 </View>
               )
             }
             const time = buildPlanTimeTextFromRow(item)
-            const content = String(item?.content ?? "").trim()
+            const content = getPlanDisplayText(item)
+            const entryMeta = getPlanEntryMeta(item?.content)
+            const isTaskRow = entryMeta.entryType === "task"
+            const isTaskDone = Boolean(entryMeta.taskCompleted)
             const category = String(item?.category_id ?? "").trim()
             const isGeneral = !category || category === "__general__"
             const categoryColor = colorByTitle.get(category) || "#94a3b8"
@@ -2367,7 +3368,6 @@ function ListScreen({
             const handleLongPress = () => {
               if (!canReorder) return
               suppressPressRef.current = true
-              pendingAutoDragIdRef.current = String(item?.id ?? "").trim()
               openReorderModal(dateKey, section?.data ?? [])
             }
             return (
@@ -2390,13 +3390,39 @@ function ListScreen({
                 </View>
                 <View style={styles.itemMainCol}>
                   <View style={styles.itemTopRow}>
-                    <Text
-                      style={[styles.itemTitle, { fontSize: fs(14) }, isDark ? styles.textDark : null]}
-                      numberOfLines={2}
-                      ellipsizeMode="tail"
-                    >
-                      {content}
-                    </Text>
+                    <View style={styles.itemPrimaryRow}>
+                      {isTaskRow ? (
+                        <Pressable
+                          accessibilityRole="checkbox"
+                          accessibilityState={{ checked: isTaskDone }}
+                          hitSlop={6}
+                          onPress={(event) => {
+                            event?.stopPropagation?.()
+                            onToggleTask?.(item)
+                          }}
+                        style={[
+                          styles.itemTaskToggle,
+                          isDark ? styles.itemTaskToggleDark : null,
+                          isTaskDone ? styles.itemTaskToggleChecked : null,
+                          isTaskDone && isDark ? styles.itemTaskToggleCheckedDark : null
+                        ]}
+                        >
+                          {isTaskDone ? <Text style={styles.itemTaskToggleTick}>✓</Text> : null}
+                        </Pressable>
+                      ) : null}
+                      <Text
+                        style={[
+                          styles.itemTitle,
+                          { fontSize: fs(14) },
+                          isDark ? styles.textDark : null,
+                          isTaskDone ? styles.itemTitleTaskDone : null
+                        ]}
+                        numberOfLines={2}
+                        ellipsizeMode="tail"
+                      >
+                        {content}
+                      </Text>
+                    </View>
                     {!isGeneral ? (
                       <View style={[styles.itemCategoryBadge, isDark ? styles.badgeDark : null]}>
                         <View style={[styles.itemCategoryDot, { backgroundColor: categoryColor }]} />
@@ -2582,9 +3608,15 @@ function MemoScreen({
   onDeleteWindow,
   onChangeWindowColor,
   onReorderWindows,
-  onSaveMemo
+  onSaveMemo,
+  onStageMemo,
+  onTasks,
+  tasksCount = 0,
+  onDdays,
+  ddayCount = 0
 }) {
   const isDark = tone === "dark"
+  const headerSubtitle = formatTodayHeaderText(new Date())
   const scale = useMemo(() => {
     const n = Number(fontScale)
     if (!Number.isFinite(n)) return 1
@@ -2601,11 +3633,22 @@ function MemoScreen({
   const [memoEditDrafts, setMemoEditDrafts] = useState({})
   const [memoFilterVisible, setMemoFilterVisible] = useState(false)
   const [memoFilterTitles, setMemoFilterTitles] = useState([])
+  const [singleMemoDocId, setSingleMemoDocId] = useState(null)
+  const [singleMemoSearch, setSingleMemoSearch] = useState("")
+  const [singleMemoSelectMode, setSingleMemoSelectMode] = useState(false)
+  const [singleMemoSelectedIds, setSingleMemoSelectedIds] = useState([])
+  const [memoCardDocIds, setMemoCardDocIds] = useState({})
   const draftRef = useRef("")
   const dirtyRef = useRef(false)
   const inputRef = useRef(null)
+  const singleTitleInputRef = useRef(null)
+  const memoTitleInputRefs = useRef({})
   const memoInputRefs = useRef({})
   const memoAllScrollRef = useRef(null)
+  const memoScrollYRef = useRef(0)
+  const memoCardFocusFieldRef = useRef({})
+  const singleMemoFocusFieldRef = useRef("content")
+  const memoActiveInputRef = useRef(null)
   const memoSaveQueueRef = useRef({})
   const memoEditDraftsRef = useRef(memoEditDrafts ?? {})
   const rightMemosRef = useRef(rightMemos ?? {})
@@ -2656,7 +3699,23 @@ function MemoScreen({
   }, [memoEditDrafts])
 
   useEffect(() => {
-    rightMemosRef.current = rightMemos ?? {}
+    const latestRightMemos = rightMemos ?? {}
+    rightMemosRef.current = latestRightMemos
+    setMemoEditDrafts((prev) => {
+      const current = prev ?? {}
+      let changed = false
+      const next = {}
+      for (const [key, value] of Object.entries(current)) {
+        if (String(value ?? "") === String(latestRightMemos?.[key] ?? "")) {
+          changed = true
+          continue
+        }
+        next[key] = value
+      }
+      if (!changed) return prev
+      memoEditDraftsRef.current = next
+      return next
+    })
   }, [rightMemos])
 
 
@@ -2718,6 +3777,7 @@ function MemoScreen({
     const key = String(tabId ?? "").trim()
     if (!key || key === "all") return Promise.resolve()
     const payload = String(text ?? "")
+    onStageMemo?.(key, payload)
     const prev = memoSaveQueueRef.current?.[key] ?? Promise.resolve()
     const next = prev.catch(() => {}).then(() => onSaveMemo?.(key, payload))
     memoSaveQueueRef.current[key] = next
@@ -2746,6 +3806,17 @@ function MemoScreen({
 
     if (prevId && dirtyRef.current && tabChanged) {
       const contentToSave = draftRef.current
+      if (String(prevId) !== "all") {
+        const optimisticDocId = buildRightMemoDocView(contentToSave, singleMemoDocId).activeDocId ?? null
+        setMemoEditDrafts((prev) => {
+          const next = { ...(prev ?? {}), [String(prevId)]: contentToSave }
+          memoEditDraftsRef.current = next
+          return next
+        })
+        if (optimisticDocId) {
+          setMemoCardDocIds((prev) => ({ ...(prev ?? {}), [String(prevId)]: optimisticDocId }))
+        }
+      }
       saveSeqRef.current += 1
       const seq = saveSeqRef.current
       Promise.resolve(prevId === "all" ? saveForAll(contentToSave) : saveForTab(prevId, contentToSave)).catch((_e) => {
@@ -2763,7 +3834,11 @@ function MemoScreen({
       saveTimerRef.current = null
     }
 
-    const nextText = String(memoText ?? "")
+    const activeKey = String(activeTabId ?? "")
+    const draftMap = memoEditDraftsRef.current ?? {}
+    const hasOptimisticText =
+      activeKey && activeKey !== "all" && Object.prototype.hasOwnProperty.call(draftMap, activeKey)
+    const nextText = String(hasOptimisticText ? draftMap[activeKey] : memoText ?? "")
     if (tabChanged || !dirtyRef.current || lastAppliedTabRef.current !== activeTabId) {
       lastAppliedTabRef.current = activeTabId
       draftRef.current = nextText
@@ -2779,6 +3854,34 @@ function MemoScreen({
   }, [activeTabId])
 
   useEffect(() => {
+    if (activeTabId === "all") return
+    const nextDocId = buildRightMemoDocView(draft, singleMemoDocId).activeDocId ?? null
+    if (nextDocId !== singleMemoDocId) setSingleMemoDocId(nextDocId)
+  }, [activeTabId, draft, singleMemoDocId])
+
+  useEffect(() => {
+    setSingleMemoSearch("")
+    setSingleMemoSelectMode(false)
+    setSingleMemoSelectedIds([])
+    memoActiveInputRef.current = null
+  }, [activeTabId])
+
+  useEffect(() => {
+    if (isEditing) {
+      setSingleMemoSelectMode(false)
+      setSingleMemoSelectedIds([])
+    } else {
+      singleMemoFocusFieldRef.current = "content"
+    }
+  }, [isEditing])
+
+  useEffect(() => {
+    if (!memoEditingId) {
+      memoActiveInputRef.current = null
+    }
+  }, [memoEditingId])
+
+  useEffect(() => {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
       const prevId = prevTabRef.current
@@ -2792,7 +3895,7 @@ function MemoScreen({
 
   const placeholder = useMemo(() => {
     if (activeTabId === "all") return "[탭제목]\n내용을 입력하세요"
-    return "메모를 입력하세요"
+    return ""
   }, [activeTabId])
   const activeWindow = useMemo(
     () => (windows ?? []).find((w) => String(w?.id ?? "") === String(activeTabId ?? "")) ?? null,
@@ -2840,6 +3943,222 @@ function MemoScreen({
     if (!selected.size) return []
     return list.filter((w) => selected.has(String(w?.title ?? "").trim()))
   }, [windows, activeTabId, memoFilterTitles])
+  const singleMemoDocView = useMemo(
+    () => buildRightMemoDocView(draft, singleMemoDocId),
+    [draft, singleMemoDocId]
+  )
+  const singleMemoListItems = useMemo(() => {
+    return (singleMemoDocView?.docs ?? []).map((doc, index) => {
+      const rawTitle = String(doc?.title ?? "").trim()
+      const fallbackTitle = getRightMemoDocDisplayTitle(rawTitle, index)
+      const content = String(doc?.content ?? "")
+      const contentLines = content
+        .split(/\r?\n/)
+        .map((line) => String(line ?? "").trim())
+        .filter(Boolean)
+      const preview = contentLines.join(" ").trim()
+      return {
+        id: doc?.id,
+        title: fallbackTitle,
+        preview,
+        rawContent: content,
+        isActive: doc?.id === singleMemoDocView?.activeDocId
+      }
+    })
+  }, [singleMemoDocView])
+  const filteredSingleMemoItems = useMemo(() => {
+    const query = String(singleMemoSearch ?? "").trim().toLowerCase()
+    if (!query) return singleMemoListItems
+    return singleMemoListItems.filter((item) => {
+      const title = String(item?.title ?? "").toLowerCase()
+      const preview = String(item?.preview ?? "").toLowerCase()
+      const raw = String(item?.rawContent ?? "").toLowerCase()
+      return title.includes(query) || preview.includes(query) || raw.includes(query)
+    })
+  }, [singleMemoListItems, singleMemoSearch])
+  const singleMemoSelectableIds = useMemo(
+    () => filteredSingleMemoItems.map((item) => String(item?.id ?? "").trim()).filter(Boolean),
+    [filteredSingleMemoItems]
+  )
+  const singleMemoSelectedCount = singleMemoSelectedIds.length
+  const areAllSingleMemosSelected =
+    singleMemoSelectableIds.length > 0 && singleMemoSelectableIds.every((id) => singleMemoSelectedIds.includes(id))
+
+  useEffect(() => {
+    const validIds = new Set((singleMemoDocView?.docs ?? []).map((doc) => String(doc?.id ?? "").trim()).filter(Boolean))
+    setSingleMemoSelectedIds((prev) => {
+      const next = prev.filter((id) => validIds.has(String(id ?? "").trim()))
+      return next.length === prev.length ? prev : next
+    })
+  }, [singleMemoDocView])
+
+  function updateMemoEditDraftRaw(windowId, updater) {
+    const key = String(windowId ?? "")
+    if (!key) return
+    setMemoEditDrafts((prev) => {
+      const currentRaw = String(prev?.[key] ?? rightMemosRef.current?.[key] ?? "")
+      const nextRaw = String(updater?.(currentRaw) ?? currentRaw)
+      const next = { ...(prev ?? {}), [key]: nextRaw }
+      memoEditDraftsRef.current = next
+      return next
+    })
+  }
+
+  function setMemoEditDraftRaw(windowId, nextRaw) {
+    const key = String(windowId ?? "")
+    if (!key) return
+    setMemoEditDrafts((prev) => {
+      const next = { ...(prev ?? {}), [key]: String(nextRaw ?? "") }
+      memoEditDraftsRef.current = next
+      return next
+    })
+  }
+
+  function markSingleDraftDirty(nextRaw) {
+    const raw = String(nextRaw ?? "")
+    draftRef.current = raw
+    dirtyRef.current = true
+    setDraft(raw)
+    if (!dirty) setDirty(true)
+    scheduleSave(raw)
+  }
+
+  function setMemoCardActiveDoc(windowId, docId) {
+    const key = String(windowId ?? "")
+    if (!key || !docId) return
+    setMemoCardDocIds((prev) => ({ ...(prev ?? {}), [key]: docId }))
+  }
+
+  function updateMemoCardDocContent(windowId, docId, nextContent) {
+    const key = String(windowId ?? "")
+    if (!key || !docId) return
+    setMemoCardActiveDoc(key, docId)
+    updateMemoEditDraftRaw(key, (currentRaw) => updateRightMemoRawForDocContent(currentRaw, docId, nextContent))
+  }
+
+  function updateMemoCardDocTitle(windowId, docId, nextTitle) {
+    const key = String(windowId ?? "")
+    if (!key || !docId) return
+    setMemoCardActiveDoc(key, docId)
+    updateMemoEditDraftRaw(key, (currentRaw) => updateRightMemoRawForDocTitle(currentRaw, docId, nextTitle))
+  }
+
+  function addMemoCardDoc(windowId) {
+    const key = String(windowId ?? "")
+    if (!key) return
+    const currentRaw = String(memoEditDraftsRef.current?.[key] ?? rightMemosRef.current?.[key] ?? "")
+    const result = addRightMemoDocToRaw(currentRaw)
+    const nextDocId = result.docId
+    setMemoEditDraftRaw(key, result.raw)
+    if (nextDocId) {
+      setMemoCardActiveDoc(key, nextDocId)
+      setMemoExpandedMap((prev) => ({ ...(prev ?? {}), [key]: true }))
+      setMemoEditingId(key)
+    }
+    Promise.resolve(saveForTab(key, result.raw)).catch((_e) => {
+      // ignore (onSaveMemo handles alerting)
+    })
+  }
+
+  function removeMemoCardDoc(windowId, docId) {
+    const key = String(windowId ?? "")
+    if (!key || !docId) return
+    const currentRaw = String(memoEditDraftsRef.current?.[key] ?? rightMemosRef.current?.[key] ?? "")
+    const result = removeRightMemoDocFromRaw(currentRaw, docId)
+    if (!result.removed) return
+    setMemoEditDraftRaw(key, result.raw)
+    setMemoCardDocIds((prev) => ({ ...(prev ?? {}), [key]: result.docId }))
+    Promise.resolve(saveForTab(key, result.raw)).catch((_e) => {
+      // ignore (onSaveMemo handles alerting)
+    })
+  }
+
+  function updateSingleMemoDocContent(nextContent) {
+    const docId = singleMemoDocView.activeDocId
+    if (!docId) return
+    setSingleMemoDocId(docId)
+    markSingleDraftDirty(updateRightMemoRawForDocContent(draftRef.current, docId, nextContent))
+  }
+
+  function updateSingleMemoDocTitle(nextTitle) {
+    const docId = singleMemoDocView.activeDocId
+    if (!docId) return
+    setSingleMemoDocId(docId)
+    markSingleDraftDirty(updateRightMemoRawForDocTitle(draftRef.current, docId, nextTitle))
+  }
+
+  function addSingleMemoDoc() {
+    const result = addRightMemoDocToRaw(draftRef.current)
+    setSingleMemoDocId(result.docId)
+    setIsEditing(true)
+    markSingleDraftDirty(result.raw)
+  }
+
+  function toggleSingleMemoSelectMode() {
+    setSingleMemoSelectMode((prev) => {
+      if (prev) setSingleMemoSelectedIds([])
+      return !prev
+    })
+  }
+
+  function toggleSingleMemoSelection(docId) {
+    const targetDocId = String(docId ?? "").trim()
+    if (!targetDocId) return
+    setSingleMemoSelectedIds((prev) => {
+      const exists = prev.includes(targetDocId)
+      if (exists) return prev.filter((id) => id !== targetDocId)
+      return [...prev, targetDocId]
+    })
+  }
+
+  function toggleSelectAllSingleMemos() {
+    if (!singleMemoSelectableIds.length) return
+    setSingleMemoSelectedIds((prev) => {
+      const allSelected = singleMemoSelectableIds.every((id) => prev.includes(id))
+      if (allSelected) return prev.filter((id) => !singleMemoSelectableIds.includes(id))
+      const next = new Set(prev)
+      singleMemoSelectableIds.forEach((id) => next.add(id))
+      return [...next]
+    })
+  }
+
+  function removeSingleMemoDocsByIds(docIds) {
+    const targets = [...new Set((docIds ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
+    if (!targets.length) return
+    let nextRaw = String(draftRef.current ?? "")
+    let nextDocId = singleMemoDocView.activeDocId ?? null
+    let removed = false
+    for (const targetDocId of targets) {
+      const result = removeRightMemoDocFromRaw(nextRaw, targetDocId)
+      nextRaw = result.raw
+      nextDocId = result.docId ?? nextDocId
+      removed = removed || result.removed
+    }
+    if (!removed) return
+    setSingleMemoDocId(nextDocId ?? null)
+    setSingleMemoSelectedIds([])
+    setSingleMemoSelectMode(false)
+    markSingleDraftDirty(nextRaw)
+  }
+
+  function confirmDeleteSelectedSingleMemos() {
+    if (!singleMemoSelectedCount) return
+    const onlyOne = singleMemoSelectedCount === 1
+    Alert.alert(
+      onlyOne ? "메모 삭제" : "메모 여러 개 삭제",
+      onlyOne
+        ? "선택한 메모를 삭제할까요?"
+        : `선택한 메모 ${singleMemoSelectedCount}개를 삭제할까요?`,
+      [
+        { text: "취소", style: "cancel" },
+        {
+          text: "삭제",
+          style: "destructive",
+          onPress: () => removeSingleMemoDocsByIds(singleMemoSelectedIds)
+        }
+      ]
+    )
+  }
 
   function scheduleSave(nextText) {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
@@ -2871,6 +4190,15 @@ function MemoScreen({
     }
     const nextText = String(draftRef.current ?? "")
     const currentText = String(rightMemosRef.current?.[key] ?? "")
+    const optimisticDocId = buildRightMemoDocView(nextText, singleMemoDocId).activeDocId ?? null
+    setMemoEditDrafts((prev) => {
+      const next = { ...(prev ?? {}), [key]: nextText }
+      memoEditDraftsRef.current = next
+      return next
+    })
+    if (optimisticDocId) {
+      setMemoCardDocIds((prev) => ({ ...(prev ?? {}), [key]: optimisticDocId }))
+    }
     if (nextText !== currentText) {
       Promise.resolve(saveForTab(key, nextText)).catch((_e) => {
         // ignore (onSaveMemo handles alerting)
@@ -2882,9 +4210,162 @@ function MemoScreen({
   }
 
   const memoPaperBottomPadding = useMemo(() => {
-    if (activeTabId === "all" || isEditing) return Math.max(48, keyboardHeight + 24)
+    if (activeTabId === "all" || isEditing || memoEditingId) return Math.max(72, keyboardHeight + 84)
     return 48
-  }, [activeTabId, isEditing, keyboardHeight])
+  }, [activeTabId, isEditing, memoEditingId, keyboardHeight])
+
+  function setMemoCardFocusField(id, field = "content") {
+    const key = String(id ?? "")
+    if (!key) return
+    memoCardFocusFieldRef.current = {
+      ...(memoCardFocusFieldRef.current ?? {}),
+      [key]: field === "title" ? "title" : "content"
+    }
+  }
+
+  function setActiveMemoInput(target) {
+    memoActiveInputRef.current = target
+  }
+
+  function handleMemoCardFieldFocus(key, field) {
+    const normalizedKey = String(key ?? "")
+    if (!normalizedKey) return
+    const normalizedField = field === "title" ? "title" : "content"
+    setMemoCardFocusField(normalizedKey, normalizedField)
+    setActiveMemoInput({ scope: "all", key: normalizedKey, field: normalizedField })
+    const target = getMemoCardEditorTarget(normalizedKey, normalizedField)
+    revealMemoEditor(target, {
+      preferredTop: normalizedField === "title" ? 156 : 220,
+      bottomGap: normalizedField === "title" ? 36 : 28
+    })
+  }
+
+  function handleMemoCardFieldBlur(key, field) {
+    const normalizedKey = String(key ?? "")
+    if (!normalizedKey) return
+    const normalizedField = field === "title" ? "title" : "content"
+    const currentFocus = memoActiveInputRef.current
+    if (
+      currentFocus?.scope === "all" &&
+      currentFocus?.key === normalizedKey &&
+      currentFocus?.field === normalizedField
+    ) {
+      memoActiveInputRef.current = null
+    }
+    setTimeout(() => {
+      const nextFocus = memoActiveInputRef.current
+      if (nextFocus?.scope === "all" && nextFocus?.key === normalizedKey) return
+      autoSaveMemoEditIfNeeded(normalizedKey)
+      setMemoEditingId((prev) => (String(prev ?? "") === normalizedKey ? null : prev))
+    }, 80)
+  }
+
+  function handleSingleMemoFieldFocus(field) {
+    const normalizedField = field === "title" ? "title" : "content"
+    singleMemoFocusFieldRef.current = normalizedField
+    setActiveMemoInput({ scope: "single", field: normalizedField })
+    const target = normalizedField === "title" ? singleTitleInputRef.current : inputRef.current
+    revealMemoEditor(target, {
+      preferredTop: normalizedField === "title" ? 156 : 220,
+      bottomGap: normalizedField === "title" ? 36 : 28
+    })
+  }
+
+  function handleSingleMemoFieldBlur(field) {
+    const normalizedField = field === "title" ? "title" : "content"
+    const currentFocus = memoActiveInputRef.current
+    if (currentFocus?.scope === "single" && currentFocus?.field === normalizedField) {
+      memoActiveInputRef.current = null
+    }
+    setTimeout(() => {
+      const nextFocus = memoActiveInputRef.current
+      if (nextFocus?.scope === "single") return
+      const currentTabId = String(activeTabIdRef.current ?? activeTabId ?? "")
+      if (!currentTabId || currentTabId === "all") return
+      finishSingleEdit(currentTabId, true)
+    }, 80)
+  }
+
+  function getMemoCardEditorTarget(id, field = "content") {
+    const key = String(id ?? "")
+    if (!key) return null
+    return field === "title" ? memoTitleInputRefs.current?.[key] : memoInputRefs.current?.[key]
+  }
+
+  const revealMemoEditor = useCallback((target = null, { preferredTop = 168, bottomGap = 28 } = {}) => {
+    const scrollRef = memoAllScrollRef.current
+    if (!scrollRef) return
+    if (target && typeof target?.measureInWindow === "function") {
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          target.measureInWindow?.((_x, y, _w, h) => {
+            const windowHeight = Dimensions.get("window").height
+            const keyboardTop = keyboardHeight > 0 ? windowHeight - keyboardHeight : windowHeight
+            const visibleBottom = keyboardTop - bottomGap
+            let nextY = memoScrollYRef.current
+            if (y < preferredTop) nextY -= preferredTop - y
+            if (y + h > visibleBottom) nextY += y + h - visibleBottom
+            nextY = Math.max(0, nextY)
+            if (Math.abs(nextY - memoScrollYRef.current) > 1) {
+              scrollRef?.scrollTo?.({ y: nextY, animated: true })
+            }
+          })
+        }, 16)
+      })
+      return
+    }
+    const nodeHandle = target ? findNodeHandle(target) : null
+    const scrollToKeyboard = scrollRef?.scrollResponderScrollNativeHandleToKeyboard
+    if (nodeHandle && typeof scrollToKeyboard === "function") {
+      requestAnimationFrame(() => {
+        scrollToKeyboard(nodeHandle, 80, true)
+      })
+      return
+    }
+    requestAnimationFrame(() => {
+      scrollRef?.scrollToEnd?.({ animated: true })
+    })
+  }, [keyboardHeight])
+
+  function focusMemoEditorTarget(targetGetter, field = "content", attempts = 0) {
+    const target = targetGetter?.()
+    if (!target) {
+      if (attempts < 6) {
+        setTimeout(() => focusMemoEditorTarget(targetGetter, field, attempts + 1), 40)
+      }
+      return
+    }
+    revealMemoEditor(target, {
+      preferredTop: field === "title" ? 156 : 220,
+      bottomGap: field === "title" ? 36 : 28
+    })
+    setTimeout(() => {
+      target?.focus?.()
+    }, 24)
+  }
+
+  useEffect(() => {
+    if (keyboardHeight <= 0) return
+    if (!isEditing && !memoEditingId) return
+    const timer = setTimeout(() => {
+      if (activeTabId === "all") {
+        const editingKey = String(memoEditingId ?? "")
+        const field = memoCardFocusFieldRef.current?.[editingKey] === "title" ? "title" : "content"
+        const target = getMemoCardEditorTarget(editingKey, field)
+        revealMemoEditor(target, {
+          preferredTop: field === "title" ? 156 : 220,
+          bottomGap: field === "title" ? 36 : 28
+        })
+        return
+      }
+      const target = singleMemoFocusFieldRef.current === "title" ? singleTitleInputRef.current : inputRef.current
+      revealMemoEditor(target, {
+        preferredTop: singleMemoFocusFieldRef.current === "title" ? 156 : 220,
+        bottomGap: singleMemoFocusFieldRef.current === "title" ? 36 : 28
+      })
+    }, 90)
+    return () => clearTimeout(timer)
+  }, [keyboardHeight, isEditing, memoEditingId, activeTabId, revealMemoEditor])
 
   function toggleMemoExpanded(id) {
     const key = String(id ?? "")
@@ -2898,7 +4379,7 @@ function MemoScreen({
   function autoSaveMemoEditIfNeeded(id) {
     const key = String(id ?? "")
     if (!key) return
-    const nextText = String(memoEditDraftsRef.current?.[key] ?? "")
+    const nextText = String(memoEditDraftsRef.current?.[key] ?? rightMemosRef.current?.[key] ?? "")
     const currentText = String(rightMemosRef.current?.[key] ?? "")
     if (nextText === currentText) return
     Promise.resolve(saveForTab(key, nextText)).catch((_e) => {
@@ -2914,29 +4395,40 @@ function MemoScreen({
     finishSingleEditRef.current = finishSingleEdit
   }, [finishSingleEdit])
 
-  function beginMemoEdit(id) {
+  function beginMemoEdit(id, focusField = "content") {
     const key = String(id ?? "")
     if (!key) return
     const prevKey = String(memoEditingId ?? "")
     if (prevKey && prevKey !== key) autoSaveMemoEditIfNeeded(prevKey)
     const current = String(rightMemosRef.current?.[key] ?? rightMemosRef.current?.[id] ?? "")
+    const currentView = buildRightMemoDocView(current, memoCardDocIds?.[key])
+    setMemoCardFocusField(key, focusField)
     setMemoEditingId(key)
     setMemoExpandedMap((prev) => ({ ...(prev ?? {}), [key]: true }))
+    setMemoCardDocIds((prev) => ({ ...(prev ?? {}), [key]: currentView.activeDocId ?? null }))
     setMemoEditDrafts((prev) => {
       const next = { ...(prev ?? {}), [key]: current }
       memoEditDraftsRef.current = next
       return next
     })
+    setTimeout(() => {
+      focusMemoEditorTarget(() => getMemoCardEditorTarget(key, focusField), focusField)
+    }, 80)
     // Enter edit mode. Keep behavior simple and stable for editing.
   }
 
-  function beginMemoEditFromTap(id) {
-    beginMemoEdit(id)
+  function beginMemoEditFromTap(id, focusField = "content") {
+    beginMemoEdit(id, focusField)
   }
 
   function beginSingleMemoEdit() {
     if (activeTabId === "all") return
+    setSingleMemoDocId(singleMemoDocView.activeDocId ?? null)
     setIsEditing(true)
+    singleMemoFocusFieldRef.current = "content"
+    setTimeout(() => {
+      focusMemoEditorTarget(() => inputRef.current, "content")
+    }, 80)
     // Enter edit mode. Keep behavior simple and stable for editing.
   }
 
@@ -2944,10 +4436,21 @@ function MemoScreen({
     beginSingleMemoEdit()
   }
 
+  function openSingleMemoDoc(docId) {
+    const nextDocId = String(docId ?? "").trim()
+    if (!nextDocId || activeTabId === "all") return
+    setSingleMemoDocId(nextDocId)
+    setIsEditing(true)
+    singleMemoFocusFieldRef.current = "content"
+    setTimeout(() => {
+      focusMemoEditorTarget(() => inputRef.current, "content")
+    }, 80)
+  }
+
   async function commitMemoEdit(id) {
     const key = String(id ?? "")
     if (!key) return
-    const text = String(memoEditDraftsRef.current?.[key] ?? "")
+    const text = String(memoEditDraftsRef.current?.[key] ?? rightMemosRef.current?.[key] ?? "")
     await saveForTab(key, text)
     setMemoEditingId(null)
     Keyboard.dismiss()
@@ -2967,19 +4470,100 @@ function MemoScreen({
     action?.(...args)
   }
 
+  function renderMemoDocTabs(docView, { onSelect, onAdd, onDelete } = {}) {
+    if (!docView?.docs?.length) return null
+    return (
+      <View style={styles.memoDocTabsRow}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.memoDocTabs}
+          style={styles.memoDocTabsScroll}
+        >
+          {docView.docs.map((doc, index) => {
+            const active = doc.id === docView.activeDocId
+            const canDeleteDoc = index > 0 && docView.docs.length > 1
+            return (
+              <View
+                key={doc.id}
+                style={[
+                  styles.memoDocTab,
+                  canDeleteDoc ? styles.memoDocTabWithDelete : styles.memoDocTabCentered,
+                  active ? styles.memoDocTabActive : null,
+                  isDark ? styles.memoDocTabDark : null,
+                  active && isDark ? styles.memoDocTabActiveDark : null
+                ]}
+              >
+                <Pressable onPress={() => onSelect?.(doc.id)} style={styles.memoDocTabPressable}>
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.memoDocTabText,
+                      active ? styles.memoDocTabTextActive : null,
+                      isDark ? styles.memoDocTabTextDark : null,
+                      active && isDark ? styles.memoDocTabTextActiveDark : null
+                    ]}
+                  >
+                    {getRightMemoDocDisplayTitle(doc.title, index)}
+                  </Text>
+                </Pressable>
+                {canDeleteDoc ? (
+                  <Pressable
+                    onPress={() => {
+                      const title = getRightMemoDocDisplayTitle(doc.title, index)
+                      Alert.alert("메모 삭제", `"${title}"를 삭제할까요?`, [
+                        { text: "취소", style: "cancel" },
+                        {
+                          text: "삭제",
+                          style: "destructive",
+                          onPress: () => onDelete?.(doc.id)
+                        }
+                      ])
+                    }}
+                    hitSlop={6}
+                    style={[styles.memoDocTabDeleteBtn, active ? styles.memoDocTabDeleteBtnActive : null]}
+                  >
+                    <Text
+                      style={[
+                        styles.memoDocTabDeleteText,
+                        active ? styles.memoDocTabDeleteTextActive : null,
+                        isDark ? styles.memoDocTabDeleteTextDark : null
+                      ]}
+                    >
+                      ×
+                    </Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            )
+          })}
+        </ScrollView>
+        <Pressable
+          onPress={onAdd}
+          style={[styles.memoDocActionBtn, isDark ? styles.memoDocActionBtnDark : null]}
+        >
+          <Text style={[styles.memoDocActionText, isDark ? styles.memoDocActionTextDark : null]}>+</Text>
+        </Pressable>
+      </View>
+    )
+  }
+
   return (
-    <SafeAreaView style={[styles.container, styles.listFill, isDark ? styles.containerDark : null]}>
+    <SafeAreaView edges={["top", "left", "right"]} style={[styles.container, styles.listFill, isDark ? styles.containerDark : null]}>
       <Header
         title="Planner"
+        subtitle={headerSubtitle}
         loading={loading}
         onRefresh={() => runOutsideContent(onRefresh)}
         onSignOut={() => runOutsideContent(onSignOut)}
+        onTasks={onTasks ? () => runOutsideContent(onTasks) : null}
+        tasksCount={tasksCount}
+        onDdays={onDdays ? () => runOutsideContent(onDdays) : null}
+        ddayCount={ddayCount}
         onFilter={activeTabId === "all" ? () => setMemoFilterVisible(true) : null}
         filterActive={activeTabId === "all" ? !isAllMemoFiltersSelected : false}
         tone={tone}
         showLogo={false}
-        titleStyle={styles.calendarTitleOffset}
-        buttonsStyle={styles.calendarButtonsOffset}
       />
       <WindowTabs
         windows={windows}
@@ -3001,33 +4585,62 @@ function MemoScreen({
             contentContainerStyle={[styles.memoPaperContent, { paddingBottom: memoPaperBottomPadding }]}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator
+            onScroll={(event) => {
+              memoScrollYRef.current = event?.nativeEvent?.contentOffset?.y ?? 0
+            }}
             scrollEventThrottle={16}
           >
             {activeTabId === "all" ? (
               <View style={styles.memoAllList}>
+                {filteredMemoWindows.length === 0 ? (
+                  <View style={[styles.memoAllEmptyCard, isDark ? styles.memoAllEmptyCardDark : null]}>
+                    <Text style={[styles.memoAllEmptyTitle, isDark ? styles.textDark : null]}>보이는 메모 탭이 없습니다.</Text>
+                    <Text style={[styles.memoAllEmptyText, isDark ? styles.textMutedDark : null]}>
+                      필터를 다시 열어 탭을 선택하거나 새 메모 탭을 만들어 보세요.
+                    </Text>
+                  </View>
+                ) : null}
                 {filteredMemoWindows.map((w) => {
                     const key = String(w.id ?? "")
-                    const body = String(rightMemos?.[key] ?? rightMemos?.[w.id] ?? "")
+                    const rawBody = String(rightMemos?.[key] ?? rightMemos?.[w.id] ?? "")
                     const isExpanded = memoExpandedMap?.[key] ?? true
                     const isEditingCard = memoEditingId === key
-                    const draftValue = memoEditDrafts?.[key] ?? body
+                    const draftValue = memoEditDrafts?.[key] ?? rawBody
+                    const cardDocView = buildRightMemoDocView(draftValue, memoCardDocIds?.[key])
+                    const cardBody = String(cardDocView.activeDoc?.content ?? "")
+                    const activeDocTitle = getRightMemoDocDisplayTitle(cardDocView.activeDoc?.title, cardDocView.activeIndex)
+                    const previewText = cardBody.trim() || "내용 없음"
                     return (
-                      <View key={w.id} style={[styles.memoAllCard, isDark ? styles.cardDark : null]}>
+                      <View
+                        key={w.id}
+                        style={[
+                          styles.memoAllCard,
+                          isDark ? styles.cardDark : null,
+                          { borderLeftWidth: 4, borderLeftColor: w.color || "#94a3b8" }
+                        ]}
+                      >
                         <View style={styles.memoAllHeader}>
                           <Pressable style={styles.memoAllHeaderLeft} onPress={() => beginMemoEditFromTap(w.id)}>
                             <View style={[styles.memoAllDot, { backgroundColor: w.color || "#94a3b8" }]} />
-                            <Text style={[styles.memoAllTitle, isDark ? styles.textDark : null]}>{w.title}</Text>
+                            <View style={styles.memoAllHeaderTextWrap}>
+                              <View style={styles.memoAllTitleRow}>
+                                <Text style={[styles.memoAllTitle, isDark ? styles.textDark : null]}>{w.title}</Text>
+                              </View>
+                            </View>
                           </Pressable>
                           <View style={styles.memoAllHeaderRight}>
-                            {isEditingCard ? (
+                            {isEditingCard && (
                               <Pressable
                                 onPress={() => commitMemoEdit(w.id)}
                                 style={[styles.memoAllEditBtn, isDark ? styles.listPillDark : null]}
                               >
                                 <Text style={[styles.memoAllEditBtnText, isDark ? styles.textDark : null]}>완료</Text>
                               </Pressable>
-                            ) : null}
-                            <Pressable onPress={() => toggleMemoExpanded(w.id)} style={styles.memoAllChevronBtn}>
+                            )}
+                            <Pressable
+                              onPress={() => toggleMemoExpanded(w.id)}
+                              style={[styles.memoAllChevronBtn, isDark ? styles.memoAllChevronBtnDark : null]}
+                            >
                               <Text style={[styles.memoAllChevron, isDark ? styles.textMutedDark : null]}>
                                 {isExpanded ? "▾" : "▸"}
                               </Text>
@@ -3035,116 +4648,324 @@ function MemoScreen({
                           </View>
                         </View>
                         {isExpanded ? (
-                          isEditingCard ? (
-                            <TextInput
-                              ref={(ref) => {
-                                if (ref) memoInputRefs.current[key] = ref
-                              }}
-                              value={draftValue}
-                              autoFocus={false}
-                              onBlur={() => {
-                                autoSaveMemoEditIfNeeded(key)
-                              }}
-                              onChangeText={(t) =>
-                                setMemoEditDrafts((prev) => {
-                                  const next = { ...(prev ?? {}), [key]: String(t ?? "") }
-                                  memoEditDraftsRef.current = next
-                                  return next
-                                })
-                              }
-                              placeholder="메모를 입력하세요"
-                              multiline
-                              scrollEnabled
-                              underlineColorAndroid="transparent"
-                              textAlignVertical="top"
-                              style={[
-                                styles.memoAllInput,
-                                { fontSize: memoFontSize, lineHeight: memoLineHeight },
-                                isDark ? styles.inputDark : null
-                              ]}
-                            />
-                          ) : (
-                            <Pressable onPress={() => beginMemoEditFromTap(w.id)}>
-                              <Text style={[styles.memoAllBody, isDark ? styles.textMutedDark : null]}>
-                                {body.trim() ? body : "내용 없음"}
-                              </Text>
-                            </Pressable>
-                          )
-                        ) : null}
+                          <>
+                            {renderMemoDocTabs(cardDocView, {
+                              onSelect: (docId) => setMemoCardActiveDoc(key, docId),
+                              onAdd: () => addMemoCardDoc(key),
+                              onDelete: (docId) => removeMemoCardDoc(key, docId)
+                            })}
+                            <View style={styles.memoAllMetaRow}>
+                              {isEditingCard ? (
+                                <TextInput
+                                  ref={(ref) => {
+                                    if (ref) memoTitleInputRefs.current[key] = ref
+                                  }}
+                                  value={String(cardDocView.activeDoc?.title ?? "")}
+                                  onFocus={() => handleMemoCardFieldFocus(key, "title")}
+                                  onBlur={() => handleMemoCardFieldBlur(key, "title")}
+                                  onChangeText={(t) => updateMemoCardDocTitle(key, cardDocView.activeDocId, t)}
+                                  placeholder={getRightMemoFallbackTitle(cardDocView.activeIndex)}
+                                  placeholderTextColor="#9aa3b2"
+                                  style={[styles.memoAllDocTitleInput, isDark ? styles.memoAllDocTitleInputDark : null]}
+                                />
+                              ) : (
+                                <Pressable
+                                  onPress={() => beginMemoEditFromTap(w.id, "title")}
+                                  style={[styles.memoAllDocBadge, isDark ? styles.memoAllDocBadgeDark : null]}
+                                >
+                                  <Text style={[styles.memoAllDocBadgeText, isDark ? styles.textDark : null]} numberOfLines={1}>
+                                    {activeDocTitle}
+                                  </Text>
+                                </Pressable>
+                              )}
+                            </View>
+                            {isEditingCard ? (
+                              <TextInput
+                                ref={(ref) => {
+                                  if (ref) memoInputRefs.current[key] = ref
+                                }}
+                                value={cardBody}
+                                autoFocus={false}
+                                onFocus={() => handleMemoCardFieldFocus(key, "content")}
+                                onBlur={() => handleMemoCardFieldBlur(key, "content")}
+                                onChangeText={(t) => updateMemoCardDocContent(key, cardDocView.activeDocId, t)}
+                                placeholder=""
+                                multiline
+                                scrollEnabled
+                                underlineColorAndroid="transparent"
+                                textAlignVertical="top"
+                                style={[
+                                  styles.memoAllInput,
+                                  { fontSize: memoFontSize, lineHeight: memoLineHeight },
+                                  isDark ? styles.inputDark : null
+                                ]}
+                              />
+                            ) : (
+                              <Pressable
+                                onPress={() => beginMemoEditFromTap(w.id)}
+                                style={[styles.memoAllPreviewCard, isDark ? styles.memoAllPreviewCardDark : null]}
+                              >
+                                <Text numberOfLines={4} style={[styles.memoAllBody, isDark ? styles.textMutedDark : null]}>
+                                  {previewText}
+                                </Text>
+                              </Pressable>
+                            )}
+                          </>
+                        ) : (
+                          <Pressable
+                            onPress={() => beginMemoEditFromTap(w.id)}
+                            style={[styles.memoAllPreviewCard, isDark ? styles.memoAllPreviewCardDark : null]}
+                          >
+                            <Text numberOfLines={2} style={[styles.memoAllBody, isDark ? styles.textMutedDark : null]}>
+                              {previewText}
+                            </Text>
+                          </Pressable>
+                        )}
                       </View>
                     )
                   })}
               </View>
             ) : (
-              <View style={styles.memoAllList}>
-                <View style={[styles.memoAllCard, isDark ? styles.cardDark : null]}>
-                  <View style={styles.memoAllHeader}>
-                    <Pressable
-                      style={styles.memoAllHeaderLeft}
-                      onPress={() => {
-                        if (activeTabId === "all") return
-                        beginSingleMemoEditFromTap()
-                      }}
-                    >
-                      <View style={[styles.memoAllDot, { backgroundColor: activeWindow?.color || "#94a3b8" }]} />
-                      <Text style={[styles.memoAllTitle, isDark ? styles.textDark : null]}>
+              <View style={styles.memoSinglePane}>
+                <View style={[styles.memoSingleHeader, isDark ? styles.memoSingleHeaderDark : null]}>
+                  <View style={styles.memoSingleHeaderLeft}>
+                    <View style={[styles.memoAllDot, { backgroundColor: activeWindow?.color || "#94a3b8" }]} />
+                    <View style={styles.memoSingleHeaderTextWrap}>
+                      <Text style={[styles.memoSingleTitle, isDark ? styles.textDark : null]}>
                         {activeWindow?.title || "\uBA54\uBAA8"}
                       </Text>
-                    </Pressable>
-                    <View style={styles.memoAllHeaderRight}>
                       {isEditing ? (
-                        <Pressable
-                          onPress={() => {
-                            finishSingleEdit(activeTabId, true)
-                            Keyboard.dismiss()
-                          }}
-                          style={[styles.memoAllEditBtn, isDark ? styles.listPillDark : null]}
-                        >
-                          <Text style={[styles.memoAllEditBtnText, isDark ? styles.textDark : null]}>완료</Text>
-                        </Pressable>
+                        <Text style={[styles.memoSingleSubtitle, isDark ? styles.textMutedDark : null]}>
+                          {"\uC81C\uBAA9\uACFC \uB0B4\uC6A9\uC744 \uB530\uB85C \uC815\uB9AC\uD558\uB294 \uBA54\uBAA8"}
+                        </Text>
+                      ) : singleMemoSelectMode ? (
+                        <Text style={[styles.memoSingleSubtitle, isDark ? styles.textMutedDark : null]}>
+                          {singleMemoSelectedCount > 0
+                            ? `${singleMemoSelectedCount}\uAC1C \uC120\uD0DD\uB428`
+                            : "\uC0AD\uC81C\uD560 \uBA54\uBAA8\uB97C \uC120\uD0DD\uD558\uC138\uC694"}
+                        </Text>
                       ) : null}
                     </View>
                   </View>
                   {isEditing ? (
-                    <TextInput
-                      ref={inputRef}
-                      value={draft}
-                      autoFocus={false}
-                      onBlur={() => finishSingleEdit(activeTabId, false)}
-                      onChangeText={(t) => {
-                        const next = String(t ?? "")
-                        draftRef.current = next
-                        dirtyRef.current = true
-                        setDraft(next)
-                        if (!dirty) setDirty(true)
-                        scheduleSave(next)
-                      }}
-                      placeholder={placeholder}
-                      multiline
-                      scrollEnabled
-                      disableFullscreenUI
-                      underlineColorAndroid="transparent"
-                      textAlignVertical="top"
-                      style={[
-                        styles.memoAllInput,
-                        {
-                          fontSize: memoFontSize,
-                          lineHeight: memoLineHeight
-                        },
-                        isDark ? styles.inputDark : null
-                      ]}
-                    />
+                    <View style={styles.memoSingleActionRow}>
+                      <Pressable
+                        onPress={() => {
+                          finishSingleEdit(activeTabId, true)
+                          Keyboard.dismiss()
+                        }}
+                        style={[
+                          styles.memoSingleActionBtn,
+                          styles.memoSingleActionBtnCompact,
+                          styles.memoSingleActionBtnPrimary,
+                          isDark ? styles.memoSingleActionBtnDark : null,
+                          isDark ? styles.memoSingleActionBtnPrimaryDark : null
+                        ]}
+                      >
+                        <Text style={styles.memoSingleActionBtnPrimaryText}>완료</Text>
+                      </Pressable>
+                    </View>
+                  ) : singleMemoSelectMode ? (
+                    <View style={styles.memoSingleActionRow}>
+                      <Pressable
+                        onPress={toggleSelectAllSingleMemos}
+                        disabled={singleMemoSelectableIds.length === 0}
+                        style={[
+                          styles.memoSingleActionBtn,
+                          styles.memoSingleActionBtnCompact,
+                          styles.memoSingleActionBtnNeutral,
+                          singleMemoSelectableIds.length === 0 ? styles.memoSingleActionBtnDisabled : null,
+                          isDark ? styles.memoSingleActionBtnDark : null,
+                          isDark ? styles.memoSingleActionBtnNeutralDark : null
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.memoSingleActionBtnNeutralText,
+                            singleMemoSelectableIds.length === 0 ? styles.memoSingleActionBtnDisabledText : null
+                          ]}
+                        >
+                          {areAllSingleMemosSelected ? "전체 해제" : "모두 선택"}
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={confirmDeleteSelectedSingleMemos}
+                        disabled={singleMemoSelectedCount === 0}
+                        style={[
+                          styles.memoSingleActionBtn,
+                          styles.memoSingleActionBtnCompact,
+                          styles.memoSingleActionBtnTextual,
+                          styles.memoSingleActionBtnDangerWide,
+                          singleMemoSelectedCount === 0 ? styles.memoSingleActionBtnDisabled : null,
+                          isDark ? styles.memoSingleActionBtnDark : null,
+                          isDark ? styles.memoSingleActionBtnDangerDark : null
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.memoSingleActionBtnDangerText,
+                            singleMemoSelectedCount === 0 ? styles.memoSingleActionBtnDisabledText : null
+                          ]}
+                        >
+                          삭제
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={toggleSingleMemoSelectMode}
+                        style={[
+                          styles.memoSingleActionBtn,
+                          styles.memoSingleActionBtnCompact,
+                          styles.memoSingleActionBtnPrimary,
+                          isDark ? styles.memoSingleActionBtnDark : null,
+                          isDark ? styles.memoSingleActionBtnPrimaryDark : null
+                        ]}
+                      >
+                        <Text style={styles.memoSingleActionBtnPrimaryText}>완료</Text>
+                      </Pressable>
+                    </View>
                   ) : (
-                    <Pressable onPress={() => beginSingleMemoEditFromTap()}>
-                      <Text style={[styles.memoAllBody, isDark ? styles.textMutedDark : null]}>
-                        {String(draft ?? "").trim() ? draft : "\uB0B4\uC6A9 \uC5C6\uC74C"}
-                      </Text>
-                    </Pressable>
+                    <View style={styles.memoSingleActionRow}>
+                      <Pressable
+                        onPress={toggleSingleMemoSelectMode}
+                        style={[
+                          styles.memoSingleActionBtn,
+                          styles.memoSingleActionBtnCompact,
+                          styles.memoSingleActionBtnPrimary,
+                          isDark ? styles.memoSingleActionBtnDark : null,
+                          isDark ? styles.memoSingleActionBtnPrimaryDark : null
+                        ]}
+                      >
+                        <Text style={styles.memoSingleActionBtnPrimaryText}>편집</Text>
+                      </Pressable>
+                    </View>
                   )}
                 </View>
+
+                {isEditing ? (
+                  <View style={[styles.memoSingleEditorCard, isDark ? styles.memoSingleEditorCardDark : null]}>
+                    <View style={styles.memoSingleFieldBlock}>
+                      <Text style={[styles.memoSingleFieldLabel, isDark ? styles.textMutedDark : null]}>제목</Text>
+                      <TextInput
+                        ref={singleTitleInputRef}
+                        value={String(singleMemoDocView.activeDoc?.title ?? "")}
+                        onFocus={() => handleSingleMemoFieldFocus("title")}
+                        onBlur={() => handleSingleMemoFieldBlur("title")}
+                        onChangeText={updateSingleMemoDocTitle}
+                        placeholder={getRightMemoFallbackTitle(singleMemoDocView.activeIndex)}
+                        placeholderTextColor="#9aa3b2"
+                        style={[styles.memoSingleTitleInput, isDark ? styles.memoSingleFieldDark : null, isDark ? styles.textDark : null]}
+                      />
+                    </View>
+                    <View style={styles.memoSingleFieldBlock}>
+                      <Text style={[styles.memoSingleFieldLabel, isDark ? styles.textMutedDark : null]}>내용</Text>
+                      <View style={[styles.memoSingleContentField, isDark ? styles.memoSingleFieldDark : null]}>
+                        <TextInput
+                          ref={inputRef}
+                          value={String(singleMemoDocView.activeDoc?.content ?? "")}
+                          autoFocus={false}
+                          onFocus={() => handleSingleMemoFieldFocus("content")}
+                          onBlur={() => handleSingleMemoFieldBlur("content")}
+                          onChangeText={updateSingleMemoDocContent}
+                          placeholder={placeholder}
+                          multiline
+                          scrollEnabled
+                          disableFullscreenUI
+                          underlineColorAndroid="transparent"
+                          textAlignVertical="top"
+                          style={[
+                            styles.memoSingleBodyInput,
+                            {
+                              fontSize: memoFontSize,
+                              lineHeight: memoLineHeight
+                            },
+                            isDark ? styles.textDark : null
+                          ]}
+                        />
+                      </View>
+                    </View>
+                  </View>
+                ) : (
+                  <>
+                    <View style={[styles.memoSingleSearchRow, isDark ? styles.memoSingleSearchRowDark : null]}>
+                      <TextInput
+                        value={singleMemoSearch}
+                        onChangeText={setSingleMemoSearch}
+                        placeholder="검색"
+                        placeholderTextColor="#9aa3b2"
+                        style={[styles.memoSingleSearchInput, isDark ? styles.textDark : null]}
+                      />
+                      <Text style={[styles.memoSingleSearchIcon, isDark ? styles.textMutedDark : null]}>⌕</Text>
+                    </View>
+
+                    <View style={styles.memoSingleList}>
+                      {filteredSingleMemoItems.map((item) => (
+                        <View
+                          key={item.id}
+                          style={[
+                            styles.memoSingleItem,
+                            isDark ? styles.memoSingleItemDark : null,
+                            singleMemoSelectedIds.includes(item.id) ? styles.memoSingleItemSelected : null,
+                            isDark && singleMemoSelectedIds.includes(item.id) ? styles.memoSingleItemSelectedDark : null
+                          ]}
+                        >
+                          {singleMemoSelectMode ? (
+                            <Pressable
+                              onPress={() => toggleSingleMemoSelection(item.id)}
+                              style={[
+                                styles.memoSingleSelectDot,
+                                singleMemoSelectedIds.includes(item.id) ? styles.memoSingleSelectDotActive : null
+                              ]}
+                              hitSlop={8}
+                            >
+                              {singleMemoSelectedIds.includes(item.id) ? (
+                                <Text style={styles.memoSingleSelectDotActiveText}>✓</Text>
+                              ) : null}
+                            </Pressable>
+                          ) : null}
+                          <Pressable
+                            onPress={() => {
+                              if (singleMemoSelectMode) {
+                                toggleSingleMemoSelection(item.id)
+                                return
+                              }
+                              openSingleMemoDoc(item.id)
+                            }}
+                            style={styles.memoSingleItemPressable}
+                          >
+                            <View style={styles.memoSingleItemMain}>
+                              <Text numberOfLines={1} style={[styles.memoSingleItemTitle, isDark ? styles.textDark : null]}>
+                                {item.title || "\uC81C\uBAA9 \uC5C6\uC74C"}
+                              </Text>
+                              <Text
+                                numberOfLines={2}
+                                style={[styles.memoSingleItemPreview, isDark ? styles.textMutedDark : null]}
+                              >
+                                {item.preview || "\uB0B4\uC6A9 \uC5C6\uC74C"}
+                              </Text>
+                            </View>
+                          </Pressable>
+                        </View>
+                      ))}
+                      {filteredSingleMemoItems.length === 0 ? (
+                        <View style={[styles.memoSingleEmpty, isDark ? styles.memoSingleEmptyDark : null]}>
+                          <Text style={[styles.memoSingleEmptyTitle, isDark ? styles.textDark : null]}>표시할 메모가 없습니다.</Text>
+                          <Text style={[styles.memoSingleEmptyText, isDark ? styles.textMutedDark : null]}>
+                            검색어를 바꾸거나 새 메모를 추가하세요.
+                          </Text>
+                        </View>
+                      ) : null}
+                    </View>
+
+                  </>
+                )}
               </View>
             )}
           </ScrollView>
+          {activeTabId !== "all" && !isEditing && !singleMemoSelectMode ? (
+            <Pressable onPress={addSingleMemoDoc} style={styles.memoSingleFab}>
+              <Text style={styles.memoSingleFabText}>+</Text>
+            </Pressable>
+          ) : null}
         </View>
       </View>
 
@@ -3212,11 +5033,15 @@ function MemoScreen({
 function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onSave, onDelete }) {
   const isDark = tone === "dark"
   const insets = useSafeAreaInsets()
+  const editorScrollRef = useRef(null)
   const [initialSnapshot, setInitialSnapshot] = useState(null)
   const [date, setDate] = useState("")
   const [time, setTime] = useState("")
   const [endTime, setEndTime] = useState("")
   const [content, setContent] = useState("")
+  const [entryType, setEntryType] = useState("plan")
+  const [taskCompleted, setTaskCompleted] = useState(false)
+  const [ddayEnabled, setDdayEnabled] = useState(false)
   const [category, setCategory] = useState("__general__")
   const [alarmEnabled, setAlarmEnabled] = useState(true)
   const [alarmLeadMinutes, setAlarmLeadMinutes] = useState(0)
@@ -3225,6 +5050,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   const [repeatDays, setRepeatDays] = useState([])
   const [repeatUntil, setRepeatUntil] = useState("")
   const [keyboardHeight, setKeyboardHeight] = useState(0)
+  const [keyboardScreenY, setKeyboardScreenY] = useState(0)
   const [showDatePicker, setShowDatePicker] = useState(false)
   const [showTimePicker, setShowTimePicker] = useState(false)
   const [showEndTimePicker, setShowEndTimePicker] = useState(false)
@@ -3245,11 +5071,15 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     }
     const repeatMeta = normalizeRepeatMeta(draft ?? {})
     const draftTimeRange = normalizePlanTimeRange(draft ?? {})
+    const entryMeta = getPlanEntryMeta(draft?.content)
     const initialState = buildPlanEditorSnapshot({
       date: String(draft?.date ?? ""),
       time: draftTimeRange.time,
       endTime: draftTimeRange.endTime,
-      content: String(draft?.content ?? ""),
+      content: entryMeta.text,
+      entryType: entryMeta.entryType,
+      taskCompleted: entryMeta.taskCompleted,
+      ddayEnabled: entryMeta.ddayEnabled,
       category: String(draft?.category_id ?? "__general__") || "__general__",
       alarmEnabled: Boolean(draft?.alarm_enabled ?? true),
       alarmLeadMinutes: normalizeAlarmLeadMinutes(draft?.alarm_lead_minutes ?? 0),
@@ -3262,6 +5092,9 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     setTime(initialState.time)
     setEndTime(initialState.endTime)
     setContent(initialState.content)
+    setEntryType(initialState.entryType)
+    setTaskCompleted(initialState.taskCompleted)
+    setDdayEnabled(initialState.ddayEnabled)
     setCategory(initialState.category)
     setAlarmEnabled(initialState.alarmEnabled)
     setAlarmLeadMinutes(initialState.alarmLeadMinutes)
@@ -3294,27 +5127,35 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
     if (!visible) return
     const showSub = Keyboard.addListener("keyboardDidShow", (e) => {
       setKeyboardHeight(e?.endCoordinates?.height ?? 0)
+      setKeyboardScreenY(Number.isFinite(e?.endCoordinates?.screenY) ? e.endCoordinates.screenY : 0)
     })
     const hideSub = Keyboard.addListener("keyboardDidHide", () => {
       setKeyboardHeight(0)
+      setKeyboardScreenY(0)
     })
     return () => {
       showSub?.remove?.()
       hideSub?.remove?.()
       setKeyboardHeight(0)
+      setKeyboardScreenY(0)
     }
   }, [visible])
 
-  const title = draft?.id ? "일정 수정" : "일정 추가"
   const isKeyboardOpen = keyboardHeight > 0
   const safeBottomInset = useMemo(
     () => Math.max(insets.bottom, Platform.OS === "android" ? 34 : 12),
     [insets.bottom]
   )
-  const keyboardLift = useMemo(() => {
-    if (!isKeyboardOpen || Platform.OS !== "android") return 0
-    return Math.min(360, Math.max(0, keyboardHeight - safeBottomInset + 10))
-  }, [isKeyboardOpen, keyboardHeight, safeBottomInset])
+  const keyboardCoveredHeight = useMemo(() => {
+    if (!isKeyboardOpen) return 0
+    const screenHeight = Dimensions.get("screen").height
+    const screenBased = keyboardScreenY > 0 ? Math.max(0, screenHeight - keyboardScreenY) : 0
+    return Math.max(keyboardHeight, screenBased)
+  }, [isKeyboardOpen, keyboardHeight, keyboardScreenY])
+  const editorBodyBottomPadding = useMemo(
+    () => (isKeyboardOpen ? keyboardCoveredHeight + 28 : 8),
+    [isKeyboardOpen, keyboardCoveredHeight]
+  )
   const dateValue = useMemo(() => parseDateKey(date) ?? new Date(), [date])
   const timeValue = useMemo(() => {
     const normalized = normalizeClockTime(time)
@@ -3349,13 +5190,21 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
   )
 
   const options = useMemo(() => {
-    const items = [{ key: "__general__", label: "통합" }]
+    const items = [{ key: "__general__", label: "없음" }]
     for (const w of windows ?? []) {
       if (!w || w.id === "all") continue
       items.push({ key: String(w.title), label: String(w.title), color: w.color || "#94a3b8" })
     }
     return items
   }, [windows])
+
+  const entryTypeOptions = useMemo(
+    () => [
+      { key: "plan", label: "일정" },
+      { key: "task", label: "Task" }
+    ],
+    []
+  )
 
   const repeatTypeOptions = useMemo(
     () => [
@@ -3366,6 +5215,23 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
       { key: "yearly", label: "매년" }
     ],
     []
+  )
+  const editorSwitchTrackColor = useMemo(
+    () =>
+      isDark
+        ? { false: "rgba(148, 163, 184, 0.28)", true: "rgba(96, 165, 250, 0.55)" }
+        : { false: "#d6dbe6", true: "#bfdbfe" },
+    [isDark]
+  )
+  const editorSwitchThumbColor = useMemo(
+    () =>
+      Platform.OS === "android"
+        ? {
+            off: isDark ? "#f8fafc" : "#ffffff",
+            on: isDark ? "#dce9ff" : ACCENT_BLUE
+          }
+        : null,
+    [isDark]
   )
   const repeatUnitLabel = useMemo(() => {
     if (repeatType === "daily") return "일"
@@ -3390,6 +5256,9 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
         time,
         endTime,
         content,
+        entryType,
+        taskCompleted,
+        ddayEnabled,
         category,
         alarmEnabled,
         alarmLeadMinutes,
@@ -3398,7 +5267,22 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
         repeatDays,
         repeatUntil
       }),
-    [date, time, endTime, content, category, alarmEnabled, alarmLeadMinutes, repeatType, repeatInterval, repeatDays, repeatUntil]
+    [
+      date,
+      time,
+      endTime,
+      content,
+      entryType,
+      taskCompleted,
+      ddayEnabled,
+      category,
+      alarmEnabled,
+      alarmLeadMinutes,
+      repeatType,
+      repeatInterval,
+      repeatDays,
+      repeatUntil
+    ]
   )
   const hasChanges = useMemo(() => {
     if (!visible || !initialSnapshot) return false
@@ -3446,12 +5330,13 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
       return
     }
     if (!normalizedTime) normalizedEndTime = ""
+    const nextContent = buildPlanContentWithMeta(content, entryType, taskCompleted, ddayEnabled)
     const payload = {
       ...(draft ?? {}),
       date,
       time: normalizedTime,
       end_time: normalizedEndTime || null,
-      content: String(content ?? "").trim(),
+      content: nextContent,
       category_id: category,
       alarm_enabled: Boolean(normalizedTime) ? Boolean(alarmEnabled) : false,
       alarm_lead_minutes: Boolean(normalizedTime) && Boolean(alarmEnabled) ? normalizeAlarmLeadMinutes(alarmLeadMinutes) : 0,
@@ -3460,13 +5345,17 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
       repeat_days: repeatType === "weekly" ? normalizeRepeatDays(repeatDays) : null,
       repeat_until: repeatType === "none" ? null : String(repeatUntil ?? "").trim() || null,
       original_repeat_type: String(draft?.repeat_type ?? "none"),
+      original_repeat_interval: draft?.original_repeat_interval ?? draft?.repeat_interval ?? 1,
+      original_repeat_days: draft?.original_repeat_days ?? draft?.repeat_days ?? null,
+      original_repeat_until: draft?.original_repeat_until ?? draft?.repeat_until ?? null,
       original_series_id: String(draft?.series_id ?? "")
     }
     if (draft?.id && (hasSeriesSource || isRecurring)) {
-      Alert.alert("반복 일정 수정", "어떤 범위에 적용할까요?", [
+      Alert.alert("반복 일정 수정", "'이번만'을 선택하면 해당 날짜의 항목만 일반 일정/Task로 바뀝니다.", [
         { text: "취소", style: "cancel" },
         { text: "이번만", onPress: () => onSave?.({ ...payload, edit_scope: "single" }) },
-        { text: "이후", onPress: () => onSave?.({ ...payload, edit_scope: "future" }) }
+        { text: "이후", onPress: () => onSave?.({ ...payload, edit_scope: "future" }) },
+        { text: "전체", onPress: () => onSave?.({ ...payload, edit_scope: "all" }) }
       ])
       return
     }
@@ -3499,6 +5388,11 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
           text: "이후",
           style: "destructive",
           onPress: () => onDelete?.({ ...(draft ?? {}), delete_scope: "future" })
+        },
+        {
+          text: "전체",
+          style: "destructive",
+          onPress: () => onDelete?.({ ...(draft ?? {}), delete_scope: "all" })
         }
       ])
       return
@@ -3526,28 +5420,75 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
             isDark ? styles.editorCardDark : null,
             isKeyboardOpen ? styles.editorCardKeyboard : null,
             {
-              marginBottom: safeBottomInset,
-              // Keep transform shape stable to avoid Fabric diff null-transform crash on Android.
-              transform: [{ translateY: -keyboardLift }]
+              marginBottom: safeBottomInset
             }
           ]}
         >
           <View style={styles.editorHeader}>
-            <Text style={[styles.editorTitle, isDark ? styles.textDark : null]}>{title}</Text>
+            <View style={styles.editorHeaderMain}>
+              <Text style={[styles.editorHeaderLabel, isDark ? styles.textMutedDark : null]}>유형</Text>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={styles.editorHeaderTypeScroll}
+                contentContainerStyle={styles.editorHeaderTypeRow}
+              >
+                {entryTypeOptions.map((opt) => {
+                  const active = opt.key === entryType
+                  return (
+                    <Pressable
+                      key={opt.key}
+                      onPress={() => setEntryType(opt.key)}
+                      style={[
+                        styles.editorCategoryPill,
+                        isDark ? styles.editorCategoryPillDark : null,
+                        active ? (isDark ? styles.editorCategoryPillActiveDark : styles.editorCategoryPillActive) : null
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.editorCategoryText,
+                          isDark ? styles.textDark : null,
+                          active ? styles.editorCategoryTextActive : null
+                        ]}
+                      >
+                        {opt.label}
+                      </Text>
+                    </Pressable>
+                  )
+                })}
+              </ScrollView>
+            </View>
             <Pressable onPress={requestClose} style={[styles.editorCloseBtn, isDark ? styles.editorCloseBtnDark : null]}>
               <Text style={[styles.editorCloseText, isDark ? styles.textDark : null]}>닫기</Text>
             </Pressable>
           </View>
 
           <ScrollView
+            ref={editorScrollRef}
             style={styles.editorBody}
-            contentContainerStyle={styles.editorBodyContent}
+            contentContainerStyle={[styles.editorBodyContent, { paddingBottom: editorBodyBottomPadding }]}
             keyboardShouldPersistTaps="handled"
             showsVerticalScrollIndicator={false}
           >
             {!isKeyboardOpen ? (
               <View style={styles.editorMetaRow}>
-                <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>날짜</Text>
+              <View style={[styles.editorMetaLabelRow, styles.editorMetaLabelRowTight]}>
+                  <Text style={[styles.editorMetaLabel, styles.editorMetaLabelInline, isDark ? styles.textMutedDark : null]}>날짜</Text>
+                  <View style={styles.editorInlineControl}>
+                    <Text style={[styles.editorInlineControlLabel, isDark ? styles.textMutedDark : null]}>D-day</Text>
+                    <InlineMiniToggle
+                      value={ddayEnabled}
+                      onToggle={setDdayEnabled}
+                      isDark={isDark}
+                      trackColorOn={editorSwitchTrackColor.true}
+                      trackColorOff={editorSwitchTrackColor.false}
+                      thumbColorOn={editorSwitchThumbColor?.on ?? (isDark ? "#dce9ff" : ACCENT_BLUE)}
+                      thumbColorOff={editorSwitchThumbColor?.off ?? "#ffffff"}
+                      accessibilityLabel="D-day 토글"
+                    />
+                  </View>
+                </View>
                 <Pressable
                   style={[styles.editorPickerRow, isDark ? styles.editorPickerRowDark : null]}
                   onPress={() => {
@@ -3569,166 +5510,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
               </View>
             ) : null}
 
-            <View style={styles.editorMetaRow}>
-              <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>카테고리</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.editorCategoryRow}>
-                {options.map((opt) => {
-                  const active = opt.key === category
-                  return (
-                    <Pressable
-                      key={opt.key}
-                      onPress={() => setCategory(opt.key)}
-                      style={[
-                        styles.editorCategoryPill,
-                        isDark ? styles.editorCategoryPillDark : null,
-                        active ? (isDark ? styles.editorCategoryPillActiveDark : styles.editorCategoryPillActive) : null
-                      ]}
-                    >
-                      {opt.key !== "__general__" ? (
-                        <View style={[styles.tabDot, { backgroundColor: opt.color || "#94a3b8" }]} />
-                      ) : null}
-                      <Text
-                        style={[
-                          styles.editorCategoryText,
-                          isDark ? styles.textDark : null,
-                          active ? styles.editorCategoryTextActive : null
-                        ]}
-                      >
-                        {opt.label}
-                      </Text>
-                    </Pressable>
-                  )
-                })}
-              </ScrollView>
-            </View>
-
-            <View style={styles.editorMetaRow}>
-              <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>시간</Text>
-              <Pressable
-                style={[styles.editorPickerRow, isDark ? styles.editorPickerRowDark : null]}
-                onPress={() => {
-                  if (Platform.OS === "ios") {
-                    setIosTempTime(timeValue)
-                    setIosTimeSheetVisible(true)
-                    return
-                  }
-                  setShowTimePicker(true)
-                }}
-              >
-                <View style={styles.editorPickerLeft}>
-                  <Text style={[styles.editorPickerValue, isDark ? styles.textDark : null]}>
-                    {time ? timeDisplay : "시간 선택 안함"}
-                  </Text>
-                </View>
-                <View style={styles.editorPickerRight}>
-                  {time ? (
-                    <Pressable
-                      onPress={() => {
-                        setTime("")
-                        setEndTime("")
-                        setAlarmEnabled(false)
-                      }}
-                      style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
-                      hitSlop={8}
-                    >
-                      <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
-                    </Pressable>
-                  ) : null}
-                  <Text style={styles.editorPickerHint}>선택</Text>
-                </View>
-              </Pressable>
-              <Pressable
-                style={[styles.editorPickerRow, isDark ? styles.editorPickerRowDark : null, styles.editorRangeRow]}
-                onPress={() => {
-                  if (!time) {
-                    Alert.alert("입력 안내", "종료시간을 먼저 고르려면 시작시간을 선택해주세요.")
-                    return
-                  }
-                  if (Platform.OS === "ios") {
-                    setIosTempEndTime(endTime ? endTimeValue : timeValue)
-                    setIosEndTimeSheetVisible(true)
-                    return
-                  }
-                  setShowEndTimePicker(true)
-                }}
-              >
-                <View style={styles.editorPickerLeft}>
-                  <Text style={[styles.editorPickerValue, isDark ? styles.textDark : null]}>
-                    {endTime ? endTimeDisplay : "종료시간 없음"}
-                  </Text>
-                </View>
-                <View style={styles.editorPickerRight}>
-                  {endTime ? (
-                    <Pressable
-                      onPress={() => setEndTime("")}
-                      style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
-                      hitSlop={8}
-                    >
-                      <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
-                    </Pressable>
-                  ) : null}
-                  <Text style={styles.editorPickerHint}>종료</Text>
-                </View>
-              </Pressable>
-              <View style={styles.editorAlarmRow}>
-                <Text style={[styles.editorAlarmLabel, isDark ? styles.textMutedDark : null]}>알림</Text>
-                <Pressable
-                  onPress={() => {
-                    if (!time) return
-                    setAlarmEnabled((prev) => !prev)
-                  }}
-                  style={[
-                    styles.editorAlarmToggle,
-                    isDark ? styles.editorAlarmToggleDark : null,
-                    time && alarmEnabled ? styles.editorAlarmToggleOn : null,
-                    time && alarmEnabled && isDark ? styles.editorAlarmToggleOnDark : null,
-                    !time ? styles.editorAlarmToggleDisabled : null
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.editorAlarmToggleText,
-                      isDark ? styles.editorAlarmToggleTextDark : null,
-                      time && alarmEnabled ? styles.editorAlarmToggleTextOn : null,
-                      !time ? styles.editorAlarmToggleTextDisabled : null
-                    ]}
-                  >
-                    {!time ? "시간 없음" : alarmEnabled ? "ON" : "OFF"}
-                  </Text>
-                </Pressable>
-              </View>
-              {time && alarmEnabled ? (
-                <View style={styles.editorAlarmLeadRow}>
-                  {alarmLeadOptions.map((opt) => {
-                    const active = normalizeAlarmLeadMinutes(alarmLeadMinutes) === opt.key
-                    return (
-                      <Pressable
-                        key={`lead-${opt.key}`}
-                        onPress={() => setAlarmLeadMinutes(opt.key)}
-                        style={[
-                          styles.editorAlarmLeadPill,
-                          isDark ? styles.editorAlarmLeadPillDark : null,
-                          active ? (isDark ? styles.editorAlarmLeadPillActiveDark : styles.editorAlarmLeadPillActive) : null
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.editorAlarmLeadText,
-                            isDark ? styles.textDark : null,
-                            active ? styles.editorAlarmLeadTextActive : null
-                          ]}
-                        >
-                          {opt.label}
-                        </Text>
-                      </Pressable>
-                    )
-                  })}
-                </View>
-              ) : null}
-            </View>
-
-            <View style={styles.editorMetaRow}>
-              <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>반복</Text>
+            <View style={[styles.editorMetaRow, styles.editorRepeatMetaRow]}>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.editorCategoryRow}>
                 {repeatTypeOptions.map((opt) => {
                   const active = opt.key === repeatType
@@ -3820,7 +5602,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                   >
                     <View style={styles.editorPickerLeft}>
                       <Text style={[styles.editorPickerValue, isDark ? styles.textDark : null]}>
-                        종료일 {repeatUntil || "1년 뒤 자동"}
+                        {repeatUntil ? `종료일 ${repeatUntil}` : "계속 반복"}
                       </Text>
                     </View>
                     <View style={styles.editorPickerRight}>
@@ -3830,7 +5612,7 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
                           style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
                           hitSlop={8}
                         >
-                          <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
+                          <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>계속</Text>
                         </Pressable>
                       ) : null}
                       <Text style={styles.editorPickerHint}>선택</Text>
@@ -3840,12 +5622,167 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
               ) : null}
             </View>
 
-            <View style={styles.editorMetaRow}>
+            <View style={[styles.editorMetaRow, styles.editorSectionGapLarge]}>
+              <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>카테고리</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.editorCategoryRow}>
+                {options.map((opt) => {
+                  const active = opt.key === category
+                  return (
+                    <Pressable
+                      key={opt.key}
+                      onPress={() => setCategory(opt.key)}
+                      style={[
+                        styles.editorCategoryPill,
+                        isDark ? styles.editorCategoryPillDark : null,
+                        active ? (isDark ? styles.editorCategoryPillActiveDark : styles.editorCategoryPillActive) : null
+                      ]}
+                    >
+                      {opt.key !== "__general__" ? (
+                        <View style={[styles.tabDot, { backgroundColor: opt.color || "#94a3b8" }]} />
+                      ) : null}
+                      <Text
+                        style={[
+                          styles.editorCategoryText,
+                          isDark ? styles.textDark : null,
+                          active ? styles.editorCategoryTextActive : null
+                        ]}
+                      >
+                        {opt.label}
+                      </Text>
+                    </Pressable>
+                  )
+                })}
+              </ScrollView>
+            </View>
+
+            <View style={[styles.editorMetaRow, styles.editorSectionGapLarge]}>
+              <View style={[styles.editorMetaLabelRow, styles.editorMetaLabelRowTight]}>
+                <Text style={[styles.editorMetaLabel, styles.editorMetaLabelInline, isDark ? styles.textMutedDark : null]}>시간</Text>
+                <View style={styles.editorInlineControl}>
+                  <Text style={[styles.editorInlineControlLabel, isDark ? styles.textMutedDark : null]}>알림</Text>
+                  <InlineMiniToggle
+                    value={Boolean(time) && alarmEnabled}
+                    onToggle={(next) => {
+                      if (!time) {
+                        Alert.alert("입력 안내", "알림을 켜려면 시간을 먼저 선택해주세요.")
+                        return
+                      }
+                      setAlarmEnabled(Boolean(next))
+                    }}
+                    isDark={isDark}
+                    trackColorOn={editorSwitchTrackColor.true}
+                    trackColorOff={editorSwitchTrackColor.false}
+                    thumbColorOn={editorSwitchThumbColor?.on ?? (isDark ? "#dce9ff" : ACCENT_BLUE)}
+                    thumbColorOff={editorSwitchThumbColor?.off ?? "#ffffff"}
+                    accessibilityLabel="알림 토글"
+                  />
+                </View>
+              </View>
+              {time && alarmEnabled ? (
+                <View style={styles.editorAlarmLeadRow}>
+                  {alarmLeadOptions.map((opt) => {
+                    const active = normalizeAlarmLeadMinutes(alarmLeadMinutes) === opt.key
+                    return (
+                      <Pressable
+                        key={`lead-${opt.key}`}
+                        onPress={() => setAlarmLeadMinutes(opt.key)}
+                        style={[
+                          styles.editorAlarmLeadPill,
+                          isDark ? styles.editorAlarmLeadPillDark : null,
+                          active ? (isDark ? styles.editorAlarmLeadPillActiveDark : styles.editorAlarmLeadPillActive) : null
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.editorAlarmLeadText,
+                            isDark ? styles.textDark : null,
+                            active ? styles.editorAlarmLeadTextActive : null
+                          ]}
+                        >
+                          {opt.label}
+                        </Text>
+                      </Pressable>
+                    )
+                  })}
+                </View>
+              ) : null}
+              <Pressable
+                style={[styles.editorPickerRow, isDark ? styles.editorPickerRowDark : null]}
+                onPress={() => {
+                  if (Platform.OS === "ios") {
+                    setIosTempTime(timeValue)
+                    setIosTimeSheetVisible(true)
+                    return
+                  }
+                  setShowTimePicker(true)
+                }}
+              >
+                <View style={styles.editorPickerLeft}>
+                  <Text style={[styles.editorPickerValue, isDark ? styles.textDark : null]}>
+                    {time ? timeDisplay : "시간 선택 안함"}
+                  </Text>
+                </View>
+                <View style={styles.editorPickerRight}>
+                  {time ? (
+                    <Pressable
+                      onPress={() => {
+                        setTime("")
+                        setEndTime("")
+                        setAlarmEnabled(false)
+                      }}
+                      style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
+                      hitSlop={8}
+                    >
+                      <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
+                    </Pressable>
+                  ) : null}
+                  <Text style={styles.editorPickerHint}>선택</Text>
+                </View>
+              </Pressable>
+              {time ? (
+                <Pressable
+                  style={[styles.editorPickerRow, isDark ? styles.editorPickerRowDark : null, styles.editorRangeRow]}
+                  onPress={() => {
+                    if (Platform.OS === "ios") {
+                      setIosTempEndTime(endTime ? endTimeValue : timeValue)
+                      setIosEndTimeSheetVisible(true)
+                      return
+                    }
+                    setShowEndTimePicker(true)
+                  }}
+                >
+                  <View style={styles.editorPickerLeft}>
+                    <Text style={[styles.editorPickerValue, isDark ? styles.textDark : null]}>
+                      {endTime ? endTimeDisplay : "종료시간 없음"}
+                    </Text>
+                  </View>
+                  <View style={styles.editorPickerRight}>
+                    {endTime ? (
+                      <Pressable
+                        onPress={() => setEndTime("")}
+                        style={[styles.editorPickerClearPill, isDark ? styles.editorPickerClearPillDark : null]}
+                        hitSlop={8}
+                      >
+                        <Text style={[styles.editorPickerClearText, isDark ? styles.textDark : null]}>없음</Text>
+                      </Pressable>
+                    ) : null}
+                    <Text style={styles.editorPickerHint}>종료</Text>
+                  </View>
+                </Pressable>
+              ) : null}
+            </View>
+
+            <View style={[styles.editorMetaRow, styles.editorSectionGapLarge]}>
               <Text style={[styles.editorMetaLabel, isDark ? styles.textMutedDark : null]}>내용</Text>
               <View style={[styles.editorTextareaWrap, isDark ? styles.editorTextareaWrapDark : null]}>
                 <TextInput
                   value={content}
                   onChangeText={setContent}
+                  onFocus={() => {
+                    setTimeout(() => {
+                      editorScrollRef.current?.scrollToEnd?.({ animated: true })
+                    }, 120)
+                  }}
                   placeholder="할 일을 입력하세요"
                   placeholderTextColor="#9aa3b2"
                   style={[styles.editorTextareaInput, isDark ? styles.textDark : null]}
@@ -3858,20 +5795,19 @@ function PlanEditorModal({ visible, draft, windows, tone = "light", onClose, onS
               </View>
             </View>
 
-          </ScrollView>
-
-          <View style={[styles.editorActions, isKeyboardOpen ? styles.editorActionsCompact : null]}>
-            {draft?.id ? (
-              <Pressable onPress={confirmDelete} style={styles.editorDangerBtn}>
-                <Text style={styles.editorDangerText}>삭제</Text>
+            <View style={[styles.editorActions, isKeyboardOpen ? styles.editorActionsCompact : null]}>
+              {draft?.id ? (
+                <Pressable onPress={confirmDelete} style={styles.editorDangerBtn}>
+                  <Text style={styles.editorDangerText}>삭제</Text>
+                </Pressable>
+              ) : (
+                <View />
+              )}
+              <Pressable onPress={handleSave} style={styles.editorSaveBtn}>
+                <Text style={styles.editorSaveText}>저장</Text>
               </Pressable>
-            ) : (
-              <View />
-            )}
-            <Pressable onPress={handleSave} style={styles.editorSaveBtn}>
-              <Text style={styles.editorSaveText}>저장</Text>
-            </Pressable>
-          </View>
+            </View>
+          </ScrollView>
         </View>
       </View>
       <PickerSheet
@@ -4064,7 +6000,12 @@ function CalendarScreen({
   onEditPlan,
   onReorderNoTime,
   onQuickDeletePlan,
-  onSelectDateKey
+  onSelectDateKey,
+  onTasks,
+  tasksCount = 0,
+  onToggleTask,
+  onDdays,
+  ddayCount = 0
 }) {
   const isDark = tone === "dark"
   const today = new Date()
@@ -4080,10 +6021,6 @@ function CalendarScreen({
   const dayReorderOriginalIdsRef = useRef([])
   const [dayReorderSaving, setDayReorderSaving] = useState(false)
   const [dayDraggingId, setDayDraggingId] = useState(null)
-  const dayDragY = useRef(new Animated.Value(0)).current
-  const dayLayoutsRef = useRef({})
-  const dayDragStateRef = useRef({ activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 })
-  const dayPendingAutoDragIdRef = useRef("")
   const daySuppressPressRef = useRef(false)
 
   const colorByTitle = useMemo(() => {
@@ -4097,6 +6034,7 @@ function CalendarScreen({
 
   const monthLabel = `${viewYear}-${pad2(viewMonth)}`
   const todayKey = dateToKey(today.getFullYear(), today.getMonth() + 1, today.getDate())
+  const headerSubtitle = formatTodayHeaderText(today)
   const filterOptions = useMemo(
     () =>
       (windows ?? [])
@@ -4135,6 +6073,11 @@ function CalendarScreen({
 
   const cellHeightPercent = `${100 / safeWeeks}%`
   const dayItems = selectedDateKey ? applyCalendarFilter(itemsByDate.get(selectedDateKey) ?? []) : []
+  const dayModalItems = useMemo(
+    () => (dayReorderMode ? dayReorderItems : buildTaskGroupedListRows(sortItemsByTimeAndOrder(dayItems), selectedDateKey)),
+    [dayItems, dayReorderItems, dayReorderMode, selectedDateKey]
+  )
+  const dayReorderBucketSections = useMemo(() => buildPlanBucketSections(dayReorderItems), [dayReorderItems])
   const selectedDateLabel = useMemo(() => {
     if (!selectedDateKey) return ""
     const dt = parseDateKey(selectedDateKey)
@@ -4144,7 +6087,6 @@ function CalendarScreen({
     return `${y}.${m}.${d}${dayName ? ` (${dayName})` : ""}`
   }, [selectedDateKey])
   const dayModalCount = dayReorderMode ? dayReorderItems.length : dayItems.length
-  const dayDraggingItem = dayReorderItems.find((item) => String(item?.id ?? "") === dayDraggingId)
 
   function moveDayItem(list, fromIndex, toIndex) {
     const safe = Array.isArray(list) ? list : []
@@ -4192,13 +6134,9 @@ function CalendarScreen({
 
   function closeDayReorderMode() {
     setDayReorderMode(false)
-    dayLayoutsRef.current = {}
-    dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-    dayPendingAutoDragIdRef.current = ""
     setDayDraggingId(null)
     setDayReorderSaving(false)
     daySuppressPressRef.current = false
-    dayDragY.setValue(0)
   }
 
   async function closeDayReorderModeWithSave() {
@@ -4214,66 +6152,20 @@ function CalendarScreen({
     dayReorderOriginalIdsRef.current = []
   }
 
-  function openDayReorder(sourceItems = null, autoDragId = "") {
+  function openDayReorder(sourceItems = null) {
     if (!onReorderNoTime) return
     const dateKey = String(selectedDateKey ?? "").trim()
     if (!dateKey) return
     const rawItems = Array.isArray(sourceItems) ? sourceItems : dayItems
-    const items = sortItemsByTimeAndOrder(rawItems)
+    const items = buildTaskOrderedRows(sortItemsByTimeAndOrder(rawItems))
     const ids = items.map((item) => String(item?.id ?? "").trim()).filter(Boolean)
     if (ids.length === 0) return
     setDayReorderMode(true)
     setDayReorderItems(items)
     dayReorderItemsRef.current = items
     dayReorderOriginalIdsRef.current = ids
-    dayLayoutsRef.current = {}
-    dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-    dayPendingAutoDragIdRef.current = String(autoDragId ?? "").trim()
     setDayDraggingId(null)
     setDayReorderSaving(false)
-    dayDragY.setValue(0)
-  }
-
-  function startDayDrag(item) {
-    if (!item) return
-    const id = String(item?.id ?? "").trim()
-    if (!id) return
-    const layout = dayLayoutsRef.current?.[id]
-    if (!layout) return
-    const list = dayReorderItemsRef.current
-    const currentIndex = Array.isArray(list) ? list.findIndex((row) => String(row?.id ?? "").trim() === id) : -1
-    if (currentIndex < 0) return
-    const startY = Number(layout.y) || 0
-    const height = Number(layout.height) || 48
-    dayDragStateRef.current = { activeId: id, startY, height, startIndex: currentIndex, currentIndex, lastSwapAt: 0 }
-    dayDragY.setValue(startY)
-    requestAnimationFrame(() => {
-      setDayDraggingId(id)
-    })
-  }
-
-  function finishDayDrag() {
-    const state = dayDragStateRef.current
-    if (!state.activeId) return
-    const activeId = String(state.activeId ?? "")
-    const cleanup = () => {
-      dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-      setDayDraggingId(null)
-    }
-
-    dayDragY.stopAnimation((currentY) => {
-      const rawTarget = Number(dayLayoutsRef.current?.[activeId]?.y ?? Number.NaN)
-      const fallback = Number.isFinite(currentY) ? currentY : Number(state.startY ?? 0)
-      const targetY = Number.isFinite(rawTarget) ? rawTarget : fallback
-      Animated.spring(dayDragY, {
-        toValue: targetY,
-        tension: 220,
-        friction: 22,
-        useNativeDriver: true
-      }).start(() => {
-        cleanup()
-      })
-    })
   }
 
   function quickDeleteFromDayReorder(item) {
@@ -4291,58 +6183,12 @@ function CalendarScreen({
           dayReorderItemsRef.current = next
           dayReorderOriginalIdsRef.current = next.map((row) => String(row?.id ?? "").trim()).filter(Boolean)
           setDayReorderItems(next)
-          if (dayDraggingId && String(dayDraggingId) === id) {
-            dayDragStateRef.current = { activeId: null, startY: 0, height: 0, startIndex: -1, currentIndex: -1, lastSwapAt: 0 }
-            setDayDraggingId(null)
-            dayDragY.setValue(0)
-          }
+          if (dayDraggingId && String(dayDraggingId) === id) setDayDraggingId(null)
           if (next.length === 0) closeDayReorderMode()
         }
       }
     ])
   }
-
-  const dayPanResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => Boolean(dayDragStateRef.current.activeId),
-        onStartShouldSetPanResponderCapture: () => Boolean(dayDragStateRef.current.activeId),
-        onMoveShouldSetPanResponder: () => Boolean(dayDragStateRef.current.activeId),
-        onMoveShouldSetPanResponderCapture: () => Boolean(dayDragStateRef.current.activeId),
-        onPanResponderMove: (_evt, gesture) => {
-          const state = dayDragStateRef.current
-          if (!state.activeId) return
-          const nextY = Number(state.startY ?? 0) + Number(gesture?.dy ?? 0)
-          dayDragY.setValue(nextY)
-          const list = dayReorderItemsRef.current
-          if (!Array.isArray(list) || list.length === 0) return
-          let currentIndex = Number(state.currentIndex ?? -1)
-          if (!Number.isFinite(currentIndex) || currentIndex < 0 || currentIndex >= list.length) {
-            currentIndex = list.findIndex((row) => String(row?.id ?? "") === String(state.activeId ?? ""))
-          }
-          if (currentIndex < 0) return
-          const now = Date.now()
-          if (now - Number(state.lastSwapAt ?? 0) < 16) return
-          const startIndex = Number.isFinite(Number(state.startIndex))
-            ? Number(state.startIndex)
-            : currentIndex
-          const rowHeight = Math.max(28, Number(state.height ?? 0) || 48)
-          const stepOffset = Number(gesture?.dy ?? 0) / rowHeight
-          const projected = Math.round(startIndex + stepOffset)
-          const targetIndex = clamp(projected, 0, list.length - 1)
-          if (targetIndex === currentIndex) return
-          const nextItems = moveDayItem(list, currentIndex, targetIndex)
-          runSwapLayoutAnimation()
-          dayReorderItemsRef.current = nextItems
-          dayDragStateRef.current = { ...state, currentIndex: targetIndex, lastSwapAt: now }
-          setDayReorderItems(nextItems)
-        },
-        onPanResponderRelease: () => finishDayDrag(),
-        onPanResponderTerminate: () => finishDayDrag(),
-        onPanResponderTerminationRequest: () => false
-      }),
-    [selectedDateKey, onReorderNoTime]
-  )
 
   async function closeDayModal() {
     if (dayReorderSaving) return
@@ -4371,20 +6217,6 @@ function CalendarScreen({
     setDayReorderItems(sorted)
     dayReorderItemsRef.current = sorted
   }, [selectedDateKey, dayItems, dayReorderMode])
-
-  useEffect(() => {
-    if (!dayReorderMode) return
-    const pendingId = String(dayPendingAutoDragIdRef.current ?? "").trim()
-    if (!pendingId) return
-    const row = dayReorderItems.find((item) => String(item?.id ?? "").trim() === pendingId)
-    if (!row) {
-      dayPendingAutoDragIdRef.current = ""
-      return
-    }
-    if (!dayLayoutsRef.current?.[pendingId]) return
-    dayPendingAutoDragIdRef.current = ""
-    startDayDrag(row)
-  }, [dayReorderMode, dayReorderItems])
 
   useEffect(() => {
     ensureHolidayYear?.(viewYear)
@@ -4474,27 +6306,45 @@ function CalendarScreen({
 
   function renderDayModalRow(item, options = {}) {
     if (!item) return null
-    const { rowKey, onPress, onLongPress, onDelete, onLayout, draggable = false, ghost = false, placeholder = false } = options
-    const line = formatLine(item)
+    if (item?.__bucketDivider) {
+      return (
+        <View key={options?.rowKey ?? String(item?.id ?? "__bucket-divider__")} style={styles.dayModalDividerRow}>
+          <View style={[styles.dayModalDividerLine, isDark ? styles.dayModalDividerLineDark : null]} />
+        </View>
+      )
+    }
+    if (item?.__taskDivider) {
+      return (
+        <View key={options?.rowKey ?? String(item?.id ?? "__task-divider__")} style={styles.dayModalDividerRow}>
+          <View style={[styles.dayModalDividerLine, isDark ? styles.dayModalDividerLineDark : null]} />
+        </View>
+      )
+    }
+    const { rowKey, onPress, onLongPress, onDelete, draggable = false, isActive = false } = options
     const time = buildPlanTimeTextFromRow(item)
-    const canLongPress = !ghost && typeof onLongPress === "function"
-    const canPress = !ghost && typeof onPress === "function"
-    const isPressable = canPress || canLongPress || (draggable && !ghost)
-    const showDelete = draggable && !ghost && !placeholder && typeof onDelete === "function"
+    const content = getPlanDisplayText(item)
+    const entryMeta = getPlanEntryMeta(item?.content)
+    const isTaskRow = entryMeta.entryType === "task"
+    const isTaskDone = Boolean(entryMeta.taskCompleted)
+    const category = String(item?.category_id ?? "").trim()
+    const isGeneral = !category || category === "__general__"
+    const categoryColor = colorByTitle.get(category) || "#94a3b8"
+    const canLongPress = typeof onLongPress === "function"
+    const canPress = typeof onPress === "function"
+    const isPressable = canPress || canLongPress || draggable
+    const showDelete = draggable && typeof onDelete === "function"
     const Container = isPressable ? Pressable : View
     return (
       <Container
         key={rowKey}
-        onLayout={onLayout}
         onPress={canPress ? onPress : undefined}
         onLongPress={canLongPress ? onLongPress : undefined}
-        delayLongPress={canLongPress ? 110 : undefined}
+        delayLongPress={canLongPress ? 90 : undefined}
         style={[
           styles.dayModalItemRow,
           isDark ? styles.dayModalItemRowDark : null,
-          ghost ? styles.reorderDragGhost : null,
-          ghost && isDark ? styles.reorderDragGhostDark : null,
-          placeholder ? styles.reorderItemPlaceholder : null
+          isActive ? styles.reorderDragGhost : null,
+          isActive && isDark ? styles.reorderDragGhostDark : null
         ]}
       >
         {time ? (
@@ -4502,7 +6352,47 @@ function CalendarScreen({
         ) : (
           <Text style={styles.dayModalItemTimeEmpty}>{"\u00A0"}</Text>
         )}
-        <Text style={[styles.dayModalItemText, isDark ? styles.textDark : null]}>{line.text}</Text>
+        <View style={styles.dayModalItemMain}>
+          <View style={styles.dayModalItemPrimary}>
+            {isTaskRow ? (
+              <Pressable
+                accessibilityRole="checkbox"
+                accessibilityState={{ checked: isTaskDone }}
+                hitSlop={6}
+                onPress={(event) => {
+                  daySuppressPressRef.current = true
+                  event?.stopPropagation?.()
+                  onToggleTask?.(item)
+                }}
+              style={[
+                styles.itemTaskToggle,
+                isDark ? styles.itemTaskToggleDark : null,
+                isTaskDone ? styles.itemTaskToggleChecked : null,
+                isTaskDone && isDark ? styles.itemTaskToggleCheckedDark : null
+              ]}
+              >
+                {isTaskDone ? <Text style={styles.itemTaskToggleTick}>✓</Text> : null}
+              </Pressable>
+            ) : null}
+            <Text
+              style={[
+                styles.dayModalItemText,
+                isDark ? styles.textDark : null,
+                isTaskDone ? styles.itemTitleTaskDone : null
+              ]}
+            >
+              {content}
+            </Text>
+          </View>
+          {!isGeneral ? (
+            <View style={[styles.itemCategoryBadge, isDark ? styles.badgeDark : null]}>
+              <View style={[styles.itemCategoryDot, { backgroundColor: categoryColor }]} />
+              <Text style={[styles.itemCategoryText, isDark ? styles.textMutedDark : null]} numberOfLines={1}>
+                {category}
+              </Text>
+            </View>
+          ) : null}
+        </View>
         {showDelete ? (
           <Pressable
             onPress={onDelete}
@@ -4519,20 +6409,23 @@ function CalendarScreen({
   const todayLabel = `${today.getMonth() + 1}/${today.getDate()}`
 
   return (
-    <SafeAreaView style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
+    <SafeAreaView edges={["top", "left", "right"]} style={[styles.container, styles.calendarFill, isDark ? styles.containerDark : null]}>
       <Header
         title="Planner"
+        subtitle={headerSubtitle}
         loading={loading}
         onRefresh={onRefresh}
         onSignOut={onSignOut}
+        onTasks={onTasks}
+        tasksCount={tasksCount}
+        onDdays={onDdays}
+        ddayCount={ddayCount}
         todayLabel={todayLabel}
         onToday={goToday}
         onFilter={activeTabId === "all" ? () => setCalendarFilterVisible(true) : null}
         filterActive={!isAllFiltersSelected}
         tone={tone}
         showLogo={false}
-        titleStyle={styles.calendarTitleOffset}
-        buttonsStyle={styles.calendarButtonsOffset}
       />
       <WindowTabs
         windows={windows}
@@ -4551,19 +6444,21 @@ function CalendarScreen({
         >
 	          <View style={[styles.calendarHeaderWrap, isDark ? styles.calendarHeaderWrapDark : null]}>
 	            <View style={[styles.calendarHeader, isDark ? styles.calendarHeaderDark : null]}>
-              <TouchableOpacity
-                style={[styles.calendarNavButton, isDark ? styles.calendarNavButtonDark : null, styles.calendarHeaderLeft]}
-                onPress={goPrevMonth}
-                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              >
-	                <Text style={[styles.calendarNavText, isDark ? styles.calendarNavTextDark : null]}>{"<"}</Text>
-	              </TouchableOpacity>
-	              <Text style={[styles.calendarTitleCentered, isDark ? styles.textDark : null]}>{monthLabel}</Text>
+	              <View style={styles.calendarHeaderLeft}>
+                <TouchableOpacity
+                  style={[styles.calendarNavButton, isDark ? styles.calendarNavButtonDark : null]}
+                  onPress={goPrevMonth}
+                  hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
+                >
+	                  <Text style={[styles.calendarNavText, isDark ? styles.calendarNavTextDark : null]}>{"<"}</Text>
+	                </TouchableOpacity>
+	              </View>
+	              <Text pointerEvents="none" style={[styles.calendarTitleCentered, isDark ? styles.textDark : null]}>{monthLabel}</Text>
 	              <View style={styles.calendarHeaderRight}>
                 <TouchableOpacity
                   style={[styles.calendarNavButton, styles.calendarNavButtonRight, isDark ? styles.calendarNavButtonDark : null]}
                   onPress={goNextMonth}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  hitSlop={{ top: 14, bottom: 14, left: 14, right: 14 }}
                 >
 	                  <Text style={[styles.calendarNavText, isDark ? styles.calendarNavTextDark : null]}>{">"}</Text>
 	                </TouchableOpacity>
@@ -4591,7 +6486,7 @@ function CalendarScreen({
 	            {cells.map((day, idx) => {
 	              const key = day ? dateToKey(viewYear, viewMonth, day) : null
 	              const rawItems = key ? itemsByDate.get(key) ?? [] : []
-	              const items = applyCalendarFilter(rawItems)
+	              const items = buildTaskOrderedRows(applyCalendarFilter(rawItems))
               const count = items.length
               const holidayName = key ? holidaysByDate?.get?.(key) ?? "" : ""
               const holidayLabel = holidayName ? String(holidayName).trim() : ""
@@ -4656,6 +6551,9 @@ function CalendarScreen({
 	                <View style={styles.calendarLineStack}>
 	                  {visible.map((item) => {
 	                    const line = formatLine(item)
+                      const entryMeta = getPlanEntryMeta(item?.content)
+                      const isTaskLine = entryMeta.entryType === "task"
+                      const isTaskDone = Boolean(entryMeta.taskCompleted)
                       const timeLabel = splitTimeLabel(line.time)
                       const hasRangeTime = Boolean(timeLabel.end)
 	                    const category = String(item?.category_id ?? "").trim()
@@ -4663,13 +6561,16 @@ function CalendarScreen({
 	                      category && category !== "__general__"
 	                        ? colorByTitle.get(category) || "#94a3b8"
 	                        : "#9aa3b2"
+                      const calendarLabelTextColor = isTaskLine ? null : getReadableCalendarTextColor(dotColor)
 	                    return (
 	                      <View key={item.id ?? `${item.date}-${item.content}`} style={styles.calendarLine}>
 	                        <View
 	                          style={[
 	                            styles.calendarLabel,
                               hasRangeTime ? styles.calendarLabelRange : null,
-	                            { backgroundColor: dotColor },
+                              isTaskLine ? styles.calendarLabelTaskPlain : null,
+                              isTaskDone ? styles.calendarLabelTaskDone : null,
+	                            { backgroundColor: isTaskLine ? "transparent" : dotColor },
 	                            isDark ? styles.calendarLabelDark : null
 	                          ]}
 	                        >
@@ -4677,10 +6578,26 @@ function CalendarScreen({
 		                            {timeLabel.start ? (
                                 hasRangeTime ? (
                                   <View style={[styles.calendarLabelTimeCol, styles.calendarLabelTimeColRange]}>
-                                    <Text numberOfLines={1} style={[styles.calendarLabelTime, isDark ? styles.calendarLabelTimeDark : null]}>
+                                    <Text
+                                      numberOfLines={1}
+                                      style={[
+                                        styles.calendarLabelTime,
+                                        isDark ? styles.calendarLabelTimeDark : null,
+                                        isTaskLine ? (isDark ? styles.calendarLabelTimeTaskDark : styles.calendarLabelTimeTask) : null,
+                                        !isTaskLine && calendarLabelTextColor ? { color: calendarLabelTextColor } : null
+                                      ]}
+                                    >
                                       {timeLabel.start}
                                     </Text>
-                                    <Text numberOfLines={1} style={[styles.calendarLabelTime, isDark ? styles.calendarLabelTimeDark : null]}>
+                                    <Text
+                                      numberOfLines={1}
+                                      style={[
+                                        styles.calendarLabelTime,
+                                        isDark ? styles.calendarLabelTimeDark : null,
+                                        isTaskLine ? (isDark ? styles.calendarLabelTimeTaskDark : styles.calendarLabelTimeTask) : null,
+                                        !isTaskLine && calendarLabelTextColor ? { color: calendarLabelTextColor } : null
+                                      ]}
+                                    >
                                       {timeLabel.end}
                                     </Text>
                                   </View>
@@ -4691,21 +6608,49 @@ function CalendarScreen({
                                       styles.calendarLabelTime,
                                       styles.calendarLabelTimeSingleSlot,
                                       styles.calendarLabelTimeSingle,
-                                      isDark ? styles.calendarLabelTimeDark : null
+                                      isDark ? styles.calendarLabelTimeDark : null,
+                                      isTaskLine ? (isDark ? styles.calendarLabelTimeTaskDark : styles.calendarLabelTimeTask) : null,
+                                      !isTaskLine && calendarLabelTextColor ? { color: calendarLabelTextColor } : null
                                     ]}
                                   >
                                     {timeLabel.start}
                                   </Text>
                                 )
                               ) : null}
+                              {isTaskLine ? (
+                                <View
+                                  style={[
+                                    styles.calendarTaskMarker,
+                                    { borderColor: dotColor },
+                                    isTaskDone ? styles.calendarTaskMarkerDone : null,
+                                    isDark ? styles.calendarTaskMarkerDark : null,
+                                    isTaskDone && isDark ? styles.calendarTaskMarkerDoneDark : null,
+                                    isTaskDone ? { backgroundColor: dotColor } : null
+                                  ]}
+                                >
+                                  {isTaskDone ? (
+                                    <Text
+                                      style={[
+                                        styles.calendarTaskMarkerText,
+                                        isDark ? styles.calendarTaskMarkerTextDark : null
+                                      ]}
+                                    >
+                                      ✓
+                                    </Text>
+                                  ) : null}
+                                </View>
+                              ) : null}
 		                          <Text
                                 numberOfLines={1}
-                                ellipsizeMode="clip"
+                                ellipsizeMode="tail"
                                 style={[
                                   styles.calendarLabelText,
-                                  !hasRangeTime ? styles.calendarLabelTextSingle : null,
+                                  !hasRangeTime && !isTaskLine ? styles.calendarLabelTextSingle : null,
                                   hasRangeTime ? styles.calendarLabelTextRange : null,
-                                  isDark ? styles.calendarLabelTextDark : null
+                                  isDark ? styles.calendarLabelTextDark : null,
+                                  isTaskLine ? (isDark ? styles.calendarLabelTextTaskDark : styles.calendarLabelTextTask) : null,
+                                  !isTaskLine && calendarLabelTextColor ? { color: calendarLabelTextColor } : null,
+                                  isTaskDone ? styles.calendarLabelTextTaskDone : null
                                 ]}
                               >
 		                            {line.text}
@@ -4791,7 +6736,7 @@ function CalendarScreen({
         animationType="fade"
         onRequestClose={closeDayModal}
       >
-        <View style={styles.dayModalOverlay}>
+        <GestureHandlerRootView style={styles.dayModalOverlay}>
           <Pressable style={styles.dayModalBackdrop} onPress={closeDayModal} />
           <View style={[styles.dayModalCard, isDark ? styles.dayModalCardDark : null]}>
             <View style={styles.dayModalHeader}>
@@ -4828,71 +6773,87 @@ function CalendarScreen({
                 )}
               </View>
             </View>
-            <ScrollView contentContainerStyle={styles.dayModalList} scrollEnabled={!dayDraggingId}>
-              {dayReorderMode ? (
-                <View style={styles.reorderNoTimeList} {...dayPanResponder.panHandlers}>
-                  {dayReorderItems.length === 0 ? (
-                    <View style={styles.dayModalEmpty}>
-                      <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
-                      <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
-                    </View>
-                  ) : (
-                    dayReorderItems.map((item) => {
-                      const rowId = String(item?.id ?? "").trim()
-                      const rowKey = rowId || `${item?.date}-${item?.content}`
-                      const isPlaceholder = rowId && rowId === dayDraggingId
-                      return renderDayModalRow(item, {
-                        rowKey,
-                        draggable: true,
-                        placeholder: isPlaceholder,
-                        onLayout: (event) => {
-                          if (!rowId) return
-                          const layout = event?.nativeEvent?.layout
-                          if (!layout) return
-                          dayLayoutsRef.current[rowId] = { y: layout.y, height: layout.height }
-                        },
-                        onLongPress: () => startDayDrag(item),
-                        onDelete: () => quickDeleteFromDayReorder(item)
-                      })
-                    })
-                  )}
-                  {dayDraggingItem ? (
-                    <Animated.View pointerEvents="none" style={[styles.reorderDragOverlay, { transform: [{ translateY: dayDragY }] }]}>
-                      {renderDayModalRow(dayDraggingItem, { ghost: true })}
-                    </Animated.View>
-                  ) : null}
-                </View>
-              ) : dayItems.length === 0 ? (
+            {dayReorderMode ? (
+              dayReorderItems.length === 0 ? (
                 <View style={styles.dayModalEmpty}>
                   <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
                   <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
                 </View>
               ) : (
-                dayItems.map((item) => {
-                  const itemId = String(item?.id ?? "").trim()
-                  const canReorder = Boolean(onReorderNoTime && itemId)
-                  const handlePress = () => {
-                    if (daySuppressPressRef.current) {
-                      daySuppressPressRef.current = false
-                      return
+                <ScrollView contentContainerStyle={styles.dayModalList} scrollEnabled={!dayDraggingId}>
+                  {dayReorderBucketSections.map((section, sectionIndex) => (
+                    <View
+                      key={`${selectedDateKey}-${section.key}`}
+                      style={[styles.reorderSection, sectionIndex === 0 ? styles.reorderSectionFirst : null]}
+                    >
+                      <Text style={[styles.reorderSectionTitle, isDark ? styles.textMutedDark : null]}>{section.title}</Text>
+                      <DraggableFlatList
+                        data={section.items}
+                        keyExtractor={(row, idx) => String(row?.id ?? `${row?.date}-${row?.content}-${idx}`)}
+                        activationDistance={6}
+                        scrollEnabled={false}
+                        nestedScrollEnabled={false}
+                        containerStyle={styles.reorderNoTimeList}
+                        animationConfig={{ damping: 20, stiffness: 220, mass: 0.35 }}
+                        onDragBegin={(index) => {
+                          const row = section.items?.[index]
+                          setDayDraggingId(String(row?.id ?? "__drag__"))
+                        }}
+                        onDragEnd={({ data }) => {
+                          const nextData = replacePlanBucketRows(dayReorderItemsRef.current, section.key, data)
+                          dayReorderItemsRef.current = nextData
+                          setDayReorderItems(nextData)
+                          setDayDraggingId(null)
+                        }}
+                        renderItem={({ item, drag, isActive }) =>
+                          renderDayModalRow(item, {
+                            rowKey: String(item?.id ?? `${item?.date}-${item?.content}`),
+                            draggable: true,
+                            isActive,
+                            onLongPress: drag,
+                            onDelete: () => quickDeleteFromDayReorder(item)
+                          })
+                        }
+                      />
+                    </View>
+                  ))}
+                </ScrollView>
+              )
+            ) : (
+              <ScrollView contentContainerStyle={styles.dayModalList} scrollEnabled={!dayDraggingId}>
+                {dayItems.length === 0 ? (
+                  <View style={styles.dayModalEmpty}>
+                    <Text style={[styles.dayModalEmptyTitle, isDark ? styles.textDark : null]}>할 일이 없어요</Text>
+                    <Text style={[styles.dayModalEmptySub, isDark ? styles.textMutedDark : null]}>이 날짜에 등록된 일정이 없습니다.</Text>
+                  </View>
+                ) : (
+                  dayModalItems.map((item) => {
+                    const itemId = String(item?.id ?? "").trim()
+                    const canReorder = !item?.__taskDivider && !item?.__bucketDivider && Boolean(onReorderNoTime && itemId)
+                    const handlePress = () => {
+                      if (daySuppressPressRef.current) {
+                        daySuppressPressRef.current = false
+                        return
+                      }
+                      if (item?.__taskDivider || item?.__bucketDivider) return
+                      onEditPlan?.(item)
                     }
-                    onEditPlan?.(item)
-                  }
-                  const handleLongPress = () => {
-                    if (!canReorder) return
-                    daySuppressPressRef.current = true
-                    openDayReorder(dayItems, itemId)
-                  }
-                  return renderDayModalRow(item, {
-                    rowKey: item.id ?? `${item.date}-${item.content}`,
-                    onPress: handlePress,
-                    onLongPress: canReorder ? handleLongPress : undefined
+                    const handleLongPress = () => {
+                      if (!canReorder) return
+                      daySuppressPressRef.current = true
+                      openDayReorder(dayItems)
+                    }
+                    return renderDayModalRow(item, {
+                      rowKey: item.id ?? `${item.date}-${item.content}-${item?.__taskDivider ? "divider" : "row"}`,
+                      onPress: handlePress,
+                      onLongPress: canReorder ? handleLongPress : undefined
+                    })
                   })
-                })
-              )}
-            </ScrollView>
+                )}
+              </ScrollView>
+            )}
           </View>
-        </View>
+        </GestureHandlerRootView>
       </Modal>
     </SafeAreaView>
   )
@@ -4901,27 +6862,16 @@ function CalendarScreen({
 function AppInner() {
   const insets = useSafeAreaInsets()
   const [settingsVisible, setSettingsVisible] = useState(false)
+  const [tasksVisible, setTasksVisible] = useState(false)
+  const [ddayVisible, setDdayVisible] = useState(false)
   const [themeMode, setThemeMode] = useState("light") // "light" | "dark"
   const [fontScale, setFontScale] = useState(1)
 
   const safeBottomInset = useMemo(
-    () => (Platform.OS === "android" ? 7 : Math.max(insets.bottom, 10)),
+    () => Math.max(Number(insets.bottom) || 0, Platform.OS === "android" ? 10 : 12),
     [insets.bottom]
   )
-  const androidNavLift = useMemo(() => {
-    if (Platform.OS !== "android") return 0
-    const inset = Number(insets.bottom) || 0
-    // Lift tab row above Android 3-button/gesture navigation area.
-    return Math.min(48, Math.max(36, inset + 8))
-  }, [insets.bottom])
-  const androidNavStripStyle = useMemo(() => {
-    if (Platform.OS !== "android") return null
-    return [
-      styles.androidNavStrip,
-      themeMode === "dark" ? styles.androidNavStripDark : styles.androidNavStripLight,
-      { height: androidNavLift }
-    ]
-  }, [androidNavLift, themeMode])
+  const tabBarVisibleHeight = 58
 
   const tabBarStyle = useMemo(() => {
     const isDark = themeMode === "dark"
@@ -4932,19 +6882,32 @@ function AppInner() {
         position: "absolute",
         left: 0,
         right: 0,
-        bottom: androidNavLift,
-        height: 52 + safeBottomInset,
-        paddingBottom: safeBottomInset
+        bottom: 0,
+        height: tabBarVisibleHeight + safeBottomInset,
+        paddingTop: 0,
+        paddingBottom: 0
       }
     ]
-  }, [androidNavLift, safeBottomInset, themeMode])
+  }, [safeBottomInset, tabBarVisibleHeight, themeMode])
 
-  const sceneBottomInset = useMemo(
-    () => 52 + safeBottomInset + androidNavLift,
-    [androidNavLift, safeBottomInset]
+  const tabBarItemStyle = useMemo(
+    () => [
+      styles.tabItem,
+      {
+        height: tabBarVisibleHeight,
+        paddingTop: 0,
+        paddingBottom: 0
+      }
+    ],
+    [tabBarVisibleHeight]
   )
 
-  const fabBottom = useMemo(() => 58 + safeBottomInset + androidNavLift + 18, [androidNavLift, safeBottomInset])
+  const sceneBottomInset = useMemo(
+    () => tabBarVisibleHeight + safeBottomInset,
+    [safeBottomInset, tabBarVisibleHeight]
+  )
+
+  const fabBottom = useMemo(() => tabBarVisibleHeight + safeBottomInset + 18, [safeBottomInset, tabBarVisibleHeight])
 
   const [session, setSession] = useState(null)
   const [clientId, setClientId] = useState("")
@@ -4980,8 +6943,20 @@ function AppInner() {
   const notificationPermissionCheckedRef = useRef(false)
   const notificationPermissionGrantedRef = useRef(false)
   const notificationSyncSeqRef = useRef(0)
+  const plansLoadSeqRef = useRef(0)
+  const openEndedRecurringSyncRef = useRef(false)
+  const windowsLoadSeqRef = useRef(0)
+  const rightMemosLoadSeqRef = useRef(0)
+  const rightMemoMetaColumnsSupportedRef = useRef(true)
+  const pendingRightMemoWritesRef = useRef({})
+  const appStateRef = useRef(AppState.currentState)
 
   const memoYear = new Date().getFullYear()
+
+  useEffect(() => {
+    setTasksVisible(false)
+    setDdayVisible(false)
+  }, [activeTabId, activeScreen])
 
   async function fetchHolidayYear(year) {
     const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${year}/KR`)
@@ -5172,7 +7147,7 @@ function AppInner() {
       const timeText = formatPlanTimeForDisplay(row)
       const rawCategory = String(row?.category_id ?? "").trim()
       const categoryLabel = !rawCategory || rawCategory === "__general__" ? "통합" : rawCategory
-      const contentText = String(row?.content ?? "").trim() || "내용 없음"
+      const contentText = getPlanDisplayText(row) || "내용 없음"
       const body = `${timeText || "시간 없음"} · ${categoryLabel} · ${contentText}`
       try {
         const content = {
@@ -5248,7 +7223,7 @@ function AppInner() {
     return () => {
       mounted = false
     }
-  }, [session?.user?.id])
+  }, [session?.user?.id, memoYear])
 
   useEffect(() => {
     let mounted = true
@@ -5285,7 +7260,7 @@ function AppInner() {
     return () => {
       mounted = false
     }
-  }, [session?.user?.id])
+  }, [session?.user?.id, memoYear])
 
   useEffect(() => {
     const userId = session?.user?.id
@@ -5309,7 +7284,37 @@ function AppInner() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "plans", filter: `user_id=eq.${userId}` },
-        () => schedule("plans", () => loadPlans(userId))
+        (payload) => {
+          const eventType = String(payload?.eventType ?? "").toUpperCase()
+          const incomingClientId = String(payload?.new?.client_id ?? payload?.old?.client_id ?? "").trim()
+          if (incomingClientId && clientId && incomingClientId === String(clientId)) return
+          if (eventType === "DELETE" || payload?.new?.deleted_at) {
+            const deletedId = String(payload?.old?.id ?? payload?.new?.id ?? "").trim()
+            if (deletedId) {
+              setPlans((prev) => (prev ?? []).filter((row) => String(row?.id ?? "").trim() !== deletedId))
+            }
+            schedule("plans", () => loadPlans(userId, { silent: true }), 120)
+            return
+          }
+          const incoming = payload?.new
+          if (incoming?.id) {
+            const normalized = {
+              ...incoming,
+              category_id: String(incoming?.category_id ?? "__general__").trim() || "__general__"
+            }
+            setPlans((prev) => {
+              const list = prev ?? []
+              const index = list.findIndex((row) => String(row?.id ?? "").trim() === String(normalized.id))
+              if (index >= 0) {
+                const next = [...list]
+                next[index] = { ...list[index], ...normalized }
+                return dedupeRowsById(next)
+              }
+              return dedupeRowsById([...list, normalized])
+            })
+          }
+          schedule("plans", () => loadPlans(userId, { silent: true }), 120)
+        }
       )
       .on(
         "postgres_changes",
@@ -5323,7 +7328,33 @@ function AppInner() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "right_memos", filter: `user_id=eq.${userId}` },
-        () => schedule("right_memos", () => loadRightMemos(userId, memoYear))
+        (payload) => {
+          const changedYear = Number(payload?.new?.year ?? payload?.old?.year ?? NaN)
+          if (Number.isFinite(changedYear) && changedYear !== memoYear) return
+          const incomingClientId = String(payload?.new?.client_id ?? payload?.old?.client_id ?? "").trim()
+          if (incomingClientId && clientId && incomingClientId === String(clientId)) return
+          const targetWindowId = String(payload?.new?.window_id ?? payload?.old?.window_id ?? "").trim()
+          if (targetWindowId && targetWindowId !== "all") {
+            const eventType = String(payload?.eventType ?? "").toUpperCase()
+            if (eventType === "DELETE") {
+              setRightMemos((prev) => {
+                const current = prev ?? {}
+                if (!Object.prototype.hasOwnProperty.call(current, targetWindowId)) return current
+                const next = { ...current }
+                delete next[targetWindowId]
+                return next
+              })
+            } else {
+              const nextContent = String(payload?.new?.content ?? "")
+              setRightMemos((prev) => {
+                const current = prev ?? {}
+                if (String(current[targetWindowId] ?? "") === nextContent) return current
+                return { ...current, [targetWindowId]: nextContent }
+              })
+            }
+          }
+          schedule("right_memos", () => loadRightMemos(userId, memoYear), 120)
+        }
       )
       .subscribe()
 
@@ -5337,7 +7368,7 @@ function AppInner() {
         // ignore
       }
     }
-  }, [session?.user?.id])
+  }, [session?.user?.id, memoYear, clientId])
 
   useEffect(() => {
     ensureHolidayYear?.(new Date().getFullYear())
@@ -5477,8 +7508,31 @@ function AppInner() {
     loadRightMemos(session.user.id, memoYear)
   }, [session?.user?.id])
 
+  useEffect(() => {
+    const userId = session?.user?.id
+    if (!supabase || !userId) return
+    const sub = AppState.addEventListener("change", (nextState) => {
+      const prevState = String(appStateRef.current ?? "")
+      appStateRef.current = nextState
+      const becameActive = prevState.match(/inactive|background/) && nextState === "active"
+      if (!becameActive) return
+      loadPlans(userId, { silent: true }).catch(() => {})
+      loadWindows(userId).catch(() => {})
+      loadRightMemos(userId, memoYear).catch(() => {})
+    })
+    return () => {
+      try {
+        sub.remove()
+      } catch (_e) {
+        // ignore
+      }
+    }
+  }, [session?.user?.id, memoYear, supabase])
+
   async function loadPlans(userId, options = {}) {
     if (!supabase || !userId) return
+    const requestSeq = plansLoadSeqRef.current + 1
+    plansLoadSeqRef.current = requestSeq
     const silent = Boolean(options?.silent)
     if (!silent) setLoading(true)
     let data = null
@@ -5516,14 +7570,22 @@ function AppInner() {
       data = fallback.data
       error = fallback.error
     }
+    if (requestSeq !== plansLoadSeqRef.current) return
     if (error) {
       setAuthMessage(error.message || "Load failed.")
       setPlans([])
     } else {
-      setPlans(data ?? [])
-      await backfillSortOrderFromLegacy(userId, data ?? [])
+      const normalizedRows = dedupeRowsById(data ?? [])
+      setPlans(normalizedRows)
+      await backfillSortOrderFromLegacy(userId, normalizedRows)
+      ensureOpenEndedRecurringCoverage(userId, normalizedRows)
+        .then((changed) => {
+          if (!changed) return
+          loadPlans(userId, { silent: true }).catch(() => {})
+        })
+        .catch(() => {})
     }
-    if (!silent) setLoading(false)
+    if (!silent && requestSeq === plansLoadSeqRef.current) setLoading(false)
   }
 
   useEffect(() => {
@@ -5574,12 +7636,15 @@ function AppInner() {
 
   async function loadWindows(userId) {
     if (!supabase || !userId) return
+    const requestSeq = windowsLoadSeqRef.current + 1
+    windowsLoadSeqRef.current = requestSeq
     const { data, error } = await supabase
       .from("windows")
       .select("*")
       .eq("user_id", userId)
       .order("sort_order", { ascending: true })
     if (error) return
+    if (requestSeq !== windowsLoadSeqRef.current) return
     const normalized = (data ?? [])
       .filter((row) => row && row.title)
       .map((row) => ({
@@ -5777,18 +7842,53 @@ function AppInner() {
 
   async function loadRightMemos(userId, year) {
     if (!supabase || !userId) return
+    const requestSeq = rightMemosLoadSeqRef.current + 1
+    rightMemosLoadSeqRef.current = requestSeq
     const { data, error } = await supabase
       .from("right_memos")
       .select("*")
       .eq("user_id", userId)
       .eq("year", year)
     if (error) return
+    if (requestSeq !== rightMemosLoadSeqRef.current) return
     const map = {}
     for (const row of data ?? []) {
       if (!row?.window_id) continue
       map[row.window_id] = String(row?.content ?? "")
     }
+    const now = Date.now()
+    const pending = { ...(pendingRightMemoWritesRef.current ?? {}) }
+    let pendingChanged = false
+    for (const [id, entry] of Object.entries(pending)) {
+      const key = String(id ?? "").trim()
+      if (!key || !entry || typeof entry !== "object") {
+        delete pending[key]
+        pendingChanged = true
+        continue
+      }
+      const expiresAt = Number(entry.expiresAt ?? 0)
+      const value = String(entry.value ?? "")
+      const loadedValue = String(map[key] ?? "")
+      if (loadedValue === value || (expiresAt > 0 && now >= expiresAt)) {
+        delete pending[key]
+        pendingChanged = true
+        continue
+      }
+      map[key] = value
+    }
+    if (pendingChanged) pendingRightMemoWritesRef.current = pending
     setRightMemos(map)
+  }
+
+  function stageRightMemoWrite(windowId, content) {
+    const id = String(windowId ?? "").trim()
+    if (!id || id === "all") return
+    const text = String(content ?? "")
+    pendingRightMemoWritesRef.current = {
+      ...(pendingRightMemoWritesRef.current ?? {}),
+      [id]: { value: text, expiresAt: Date.now() + 5000 }
+    }
+    setRightMemos((prev) => ({ ...(prev ?? {}), [id]: text }))
   }
 
   async function saveRightMemo(windowId, content) {
@@ -5797,35 +7897,45 @@ function AppInner() {
     const id = String(windowId ?? "").trim()
     if (!id || id === "all") return
     const text = String(content ?? "")
-    const trimmed = text.trim()
-    if (!trimmed) {
-      const { error } = await supabase
-        .from("right_memos")
-        .delete()
-        .eq("user_id", userId)
-        .eq("year", memoYear)
-        .eq("window_id", id)
-      if (error) {
-        Alert.alert("오류", error.message || "메모 삭제 실패")
-        return
-      }
-      setRightMemos((prev) => ({ ...(prev ?? {}), [id]: "" }))
-      return
-    }
-    const payload = {
+    stageRightMemoWrite(id, text)
+    const basePayload = {
       user_id: userId,
       year: memoYear,
       window_id: id,
       content: text
     }
-    const { error } = await supabase.from("right_memos").upsert(payload, {
-      onConflict: "user_id,year,window_id"
-    })
+    let error = null
+    if (rightMemoMetaColumnsSupportedRef.current) {
+      const result = await supabase.from("right_memos").upsert(
+        {
+          ...basePayload,
+          updated_at: new Date().toISOString(),
+          client_id: clientId || null
+        },
+        { onConflict: "user_id,year,window_id" }
+      )
+      error = result?.error ?? null
+      if (error && isRightMemoMetaColumnError(error)) {
+        rightMemoMetaColumnsSupportedRef.current = false
+        error = null
+      } else if (!error) {
+        return
+      }
+    }
+    if (!error) {
+      const result = await supabase.from("right_memos").upsert(basePayload, {
+        onConflict: "user_id,year,window_id"
+      })
+      error = result?.error ?? null
+    }
     if (error) {
+      const nextPending = { ...(pendingRightMemoWritesRef.current ?? {}) }
+      delete nextPending[id]
+      pendingRightMemoWritesRef.current = nextPending
       Alert.alert("오류", error.message || "메모 저장 실패")
+      await loadRightMemos(userId, memoYear)
       return
     }
-    setRightMemos((prev) => ({ ...(prev ?? {}), [id]: text }))
   }
 
   function getNextSortOrderForDate(dateKey, planRows) {
@@ -5935,6 +8045,15 @@ function isEndTimeColumnError(error) {
   return msg.includes("end_time") || (msg.includes("column") && msg.includes("end") && msg.includes("time"))
 }
 
+function isRightMemoMetaColumnError(error) {
+  const msg = String(error?.message ?? "").toLowerCase()
+  if (!msg) return false
+  return (
+    msg.includes("right_memos") &&
+    (msg.includes("client_id") || msg.includes("updated_at") || (msg.includes("column") && msg.includes("memo")))
+  )
+}
+
   function markRepeatFallbackNotice() {
     if (!repeatColumnsSupportedRef.current) return
     repeatColumnsSupportedRef.current = false
@@ -5982,7 +8101,8 @@ function isEndTimeColumnError(error) {
       repeatType: repeatMeta.repeatType,
       repeatInterval: repeatMeta.repeatInterval,
       repeatDays: repeatMeta.repeatDays ?? [],
-      repeatUntilKey: repeatMeta.repeatUntil
+      repeatUntilKey: repeatMeta.repeatUntil,
+      spanDays: repeatMeta.repeatUntil ? REPEAT_DEFAULT_SPAN_DAYS : getOpenEndedRepeatSpanDays(dateKey)
     })
     const shouldAssignSortOrder = sortOrderSupportedRef.current && (forceSortOrder || !next?.id)
     const sortOrderSeeds = new Map()
@@ -6006,6 +8126,90 @@ function isEndTimeColumnError(error) {
         sortOrderOverride
       })
     })
+  }
+
+  function buildOpenEndedRecurringAppendRows(userId, planRows) {
+    if (!repeatColumnsSupportedRef.current) return []
+    const rows = Array.isArray(planRows) ? planRows.filter((row) => row && !row?.deleted_at) : []
+    if (rows.length === 0) return []
+
+    const horizonKey = dateKeyFromDate(getOpenEndedRepeatHorizonDate())
+    const horizonMs = keyToTime(horizonKey)
+    const groups = new Map()
+
+    for (const row of rows) {
+      const repeatMeta = normalizeRepeatMeta(row)
+      const seriesId = String(repeatMeta.seriesId ?? "").trim()
+      const dateKey = String(row?.date ?? "").trim()
+      if (!seriesId || !dateKey) continue
+      if (repeatMeta.repeatType === "none" || repeatMeta.repeatUntil) continue
+      const current = groups.get(seriesId)
+      if (!current) {
+        groups.set(seriesId, {
+          seriesId,
+          repeatMeta,
+          startDateKey: dateKey,
+          latestDateKey: dateKey,
+          sampleRow: row
+        })
+        continue
+      }
+      if (keyToTime(dateKey) < keyToTime(current.startDateKey)) {
+        current.startDateKey = dateKey
+        current.sampleRow = row
+      }
+      if (keyToTime(dateKey) > keyToTime(current.latestDateKey)) {
+        current.latestDateKey = dateKey
+      }
+    }
+
+    const nextRows = []
+    const mergedRows = [...rows]
+
+    for (const group of groups.values()) {
+      const latestMs = keyToTime(group.latestDateKey)
+      if (!Number.isFinite(latestMs) || latestMs >= horizonMs) continue
+      const desiredKeys = generateRecurringDateKeys({
+        startDateKey: group.startDateKey,
+        repeatType: group.repeatMeta.repeatType,
+        repeatInterval: group.repeatMeta.repeatInterval,
+        repeatDays: group.repeatMeta.repeatDays ?? [],
+        repeatUntilKey: null,
+        spanDays: getOpenEndedRepeatSpanDays(group.startDateKey)
+      }).filter((key) => keyToTime(key) > latestMs && keyToTime(key) <= horizonMs)
+
+      for (const nextDateKey of desiredKeys) {
+        const sortOrderOverride = sortOrderSupportedRef.current ? getNextSortOrderForDate(nextDateKey, mergedRows) : null
+        const nextRow = buildSinglePlanPayload(userId, group.sampleRow, {
+          seriesIdOverride: group.seriesId,
+          dateOverride: nextDateKey,
+          sortOrderOverride
+        })
+        nextRows.push(nextRow)
+        mergedRows.push(nextRow)
+      }
+    }
+
+    return nextRows
+  }
+
+  async function ensureOpenEndedRecurringCoverage(userId, planRows) {
+    if (!supabase || !userId || openEndedRecurringSyncRef.current) return false
+    const appendRows = buildOpenEndedRecurringAppendRows(userId, planRows)
+    if (appendRows.length === 0) return false
+
+    openEndedRecurringSyncRef.current = true
+    try {
+      await insertPlansInChunks(appendRows)
+      return true
+    } catch (error) {
+      if (!isDuplicateConflictError(error)) {
+        console.warn("mobile open-ended recurring sync", error)
+      }
+      return false
+    } finally {
+      openEndedRecurringSyncRef.current = false
+    }
   }
 
   async function insertPlansInChunks(rows) {
@@ -6056,6 +8260,55 @@ function isEndTimeColumnError(error) {
       markEndTimeFallbackNotice()
       const retry = await supabase.from("plans").update(stripEndTimeColumns(payload)).eq("id", id).eq("user_id", userId)
       error = retry.error
+    }
+    if (error) throw error
+  }
+
+  async function updateRecurringSeriesRows(userId, next, { futureOnly = false } = {}) {
+    const sourceSeriesId = String(next?.original_series_id ?? next?.series_id ?? "").trim()
+    if (!supabase || !userId || !sourceSeriesId) return
+
+    const updatedAt = new Date().toISOString()
+    const normalizedTime = normalizeClockTime(next?.time)
+    let normalizedEndTime = normalizeClockTime(next?.end_time ?? next?.endTime)
+    if (!normalizedTime || !normalizedEndTime || normalizedEndTime === normalizedTime) normalizedEndTime = ""
+
+    const payload = {
+      content: String(next?.content ?? "").trim(),
+      category_id: String(next?.category_id ?? "__general__").trim() || "__general__",
+      time: normalizedTime || null,
+      updated_at: updatedAt,
+      client_id: clientId || null
+    }
+    if (endTimeColumnSupportedRef.current) payload.end_time = normalizedEndTime || null
+
+    let query = supabase
+      .from("plans")
+      .update(payload)
+      .eq("user_id", userId)
+      .eq("series_id", sourceSeriesId)
+      .is("deleted_at", null)
+
+    if (futureOnly) {
+      const futureFrom = String(next?.original_date ?? next?.date ?? "").trim() || String(next?.date ?? "").trim()
+      query = query.gte("date", futureFrom)
+    }
+
+    let { error } = await query
+    if (error && isEndTimeColumnError(error)) {
+      markEndTimeFallbackNotice()
+      let retry = supabase
+        .from("plans")
+        .update(stripEndTimeColumns(payload))
+        .eq("user_id", userId)
+        .eq("series_id", sourceSeriesId)
+        .is("deleted_at", null)
+      if (futureOnly) {
+        const futureFrom = String(next?.original_date ?? next?.date ?? "").trim() || String(next?.date ?? "").trim()
+        retry = retry.gte("date", futureFrom)
+      }
+      const retryResult = await retry
+      error = retryResult.error
     }
     if (error) throw error
   }
@@ -6160,7 +8413,6 @@ function isEndTimeColumnError(error) {
     const nextAlarmEnabled = hasTimeText ? Boolean(next?.alarm_enabled ?? true) : true
     const nextAlarmLeadMinutes = hasTimeText && nextAlarmEnabled ? normalizeAlarmLeadMinutes(next?.alarm_lead_minutes) : 0
 
-    setLoading(true)
     try {
       let affectedPlanIds = []
       const editScope = String(next?.edit_scope ?? "single")
@@ -6169,11 +8421,29 @@ function isEndTimeColumnError(error) {
         ? String(next?.original_series_id ?? next?.series_id ?? "").trim()
         : ""
       const sourceRepeatType = normalizeRepeatType(next?.original_repeat_type ?? next?.repeat_type)
+      const nextRepeatInterval = normalizeRepeatInterval(next?.repeat_interval)
+      const sourceRepeatInterval = normalizeRepeatInterval(next?.original_repeat_interval ?? next?.repeat_interval)
+      const nextRepeatDays = normalizeRepeatDays(next?.repeat_days)
+      const sourceRepeatDays = normalizeRepeatDays(next?.original_repeat_days ?? next?.repeat_days)
+      const nextRepeatUntil = String(next?.repeat_until ?? "").trim()
+      const sourceRepeatUntil = String(next?.original_repeat_until ?? next?.repeat_until ?? "").trim()
+      const originalDate = String(next?.original_date ?? "").trim()
       const legacySeriesIds = [...new Set((next?.legacy_series_ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
       const legacyFutureIds = [...new Set((next?.legacy_future_ids ?? []).map((id) => String(id ?? "").trim()).filter(Boolean))]
       const sourceIsRecurring = Boolean(sourceSeriesId) || sourceRepeatType !== "none"
+      const shouldDetachSingleOccurrence = Boolean(next?.id) && sourceIsRecurring && editScope === "single"
       const enableRecurringFromSingle = Boolean(next?.id) && !sourceIsRecurring && nextRepeatType !== "none"
       const shouldRegenerate = Boolean(next?.id) && (editScope === "future" || editScope === "all" || enableRecurringFromSingle)
+      const canUpdateRecurringInPlace =
+        Boolean(next?.id) &&
+        sourceIsRecurring &&
+        (editScope === "future" || editScope === "all") &&
+        Boolean(sourceSeriesId) &&
+        nextRepeatType === sourceRepeatType &&
+        nextRepeatInterval === sourceRepeatInterval &&
+        sameRepeatDays(nextRepeatDays, sourceRepeatDays) &&
+        nextRepeatUntil === sourceRepeatUntil &&
+        String(next?.date ?? "").trim() === originalDate
 
       if (next?.id && !shouldRegenerate) {
         const nextDate = String(next?.date ?? "").trim()
@@ -6185,12 +8455,24 @@ function isEndTimeColumnError(error) {
         const shouldAssignSortOrder =
           sortOrderSupportedRef.current && !nextTime && (dateChanged || becameNoTime)
         const sortOrderOverride = shouldAssignSortOrder ? getNextSortOrderForDate(nextDate, plans) : null
-        const payload = buildSinglePlanPayload(userId, next, {
-          seriesIdOverride: nextRepeatType === "none" ? null : sourceSeriesId || null,
+        const singlePayloadSource = shouldDetachSingleOccurrence
+          ? {
+              ...(next ?? {}),
+              repeat_type: "none",
+              repeat_interval: 1,
+              repeat_days: null,
+              repeat_until: null
+            }
+          : next
+        const payload = buildSinglePlanPayload(userId, singlePayloadSource, {
+          seriesIdOverride: shouldDetachSingleOccurrence ? null : nextRepeatType === "none" ? null : sourceSeriesId || null,
           sortOrderOverride
         })
         await updatePlanRow(userId, next.id, payload)
         affectedPlanIds = [String(next.id)]
+      } else if (canUpdateRecurringInPlace) {
+        await updateRecurringSeriesRows(userId, next, { futureOnly: editScope === "future" })
+        affectedPlanIds = []
       } else if (next?.id && shouldRegenerate) {
         // Pre-calculate legacy ids so we can still delete old rows if repeat-column fallback happens mid-save.
         const useLegacyRange = Boolean(next?.has_recurrence_hint) && (editScope === "future" || editScope === "all")
@@ -6272,10 +8554,10 @@ function isEndTimeColumnError(error) {
         affectedPlanIds = await insertPlansInChunks(rows)
       }
 
-      await Promise.all([
+      Promise.all([
         setAlarmEnabledForIds(userId, affectedPlanIds, nextAlarmEnabled),
         setAlarmLeadMinutesForIds(userId, affectedPlanIds, nextAlarmLeadMinutes)
-      ])
+      ]).catch(() => {})
       loadPlans(userId, { silent: true }).catch(() => {})
       return true
     } catch (error) {
@@ -6283,8 +8565,6 @@ function isEndTimeColumnError(error) {
       setAuthMessage(message)
       Alert.alert("저장 실패", message)
       return false
-    } finally {
-      setLoading(false)
     }
   }
 
@@ -6514,6 +8794,9 @@ function isEndTimeColumnError(error) {
       repeat_until: effectiveRepeatUntil,
       series_id: repeatMeta.seriesId,
       original_repeat_type: effectiveRepeatType,
+      original_repeat_interval: effectiveRepeatInterval,
+      original_repeat_days: effectiveRepeatDays,
+      original_repeat_until: effectiveRepeatUntil,
       original_series_id: repeatMeta.seriesId,
       has_recurrence_hint: hasRecurrenceHint,
       legacy_series_ids: legacySeriesIds,
@@ -6522,10 +8805,81 @@ function isEndTimeColumnError(error) {
     setPlanEditorVisible(true)
   }
 
+  function openTaskItem(item) {
+    const row = item?.row ?? item
+    if (!row) return
+    setTasksVisible(false)
+    setDdayVisible(false)
+    setTimeout(() => {
+      openEditPlan(row)
+    }, 80)
+  }
+
+  async function toggleTaskCompletion(item) {
+    const row = item?.row ?? item
+    const userId = session?.user?.id
+    const rowId = String(row?.id ?? "").trim()
+    if (!userId || !rowId) return
+
+    const parsed = parsePlanMetaSuffixes(row?.content)
+    if (parsed.completed == null || !parsed.baseRaw) return
+
+    const nextCompleted = !Boolean(parsed.completed)
+    const nextContent = buildPlanContentWithMeta(parsed.baseRaw, "task", nextCompleted, parsed.dday)
+    const updatedAt = new Date().toISOString()
+
+    setPlans((prev) =>
+      (prev ?? []).map((current) =>
+        String(current?.id ?? "").trim() === rowId
+          ? { ...current, content: nextContent, updated_at: updatedAt, client_id: clientId || current?.client_id || null }
+          : current
+      )
+    )
+
+    try {
+      await updatePlanRow(userId, rowId, {
+        content: nextContent,
+        updated_at: updatedAt,
+        client_id: clientId || null
+      })
+    } catch (error) {
+      Alert.alert("Task 저장 실패", error?.message || "상태 변경에 실패했습니다.")
+      await loadPlans(userId)
+    }
+  }
+
   const filteredPlans = useMemo(() => {
     if (!activeTitle) return plans
     return (plans ?? []).filter((row) => String(row?.category_id ?? "").trim() === activeTitle)
   }, [plans, activeTitle])
+
+  const todayForTasks = new Date()
+  const taskTodayKey = dateToKey(todayForTasks.getFullYear(), todayForTasks.getMonth() + 1, todayForTasks.getDate())
+
+  const taskItems = useMemo(() => extractTaskItemsFromPlanRows(filteredPlans), [filteredPlans])
+
+  const upcomingDdayItems = useMemo(
+    () => extractUpcomingDdayItemsFromPlanRows(filteredPlans, taskTodayKey, 10),
+    [filteredPlans, taskTodayKey]
+  )
+
+  const taskCount = useMemo(() => {
+    const ids = new Set()
+    for (const item of taskItems ?? []) {
+      const key = String(item?.planId ?? item?.id ?? "").trim()
+      if (key) ids.add(key)
+    }
+    return ids.size
+  }, [taskItems])
+
+  const ddayCount = useMemo(() => {
+    const ids = new Set()
+    for (const item of upcomingDdayItems ?? []) {
+      const key = String(item?.planId ?? item?.id ?? "").trim()
+      if (key) ids.add(key)
+    }
+    return ids.size
+  }, [upcomingDdayItems])
 
   const sections = useMemo(() => {
     const map = new Map()
@@ -6574,7 +8928,7 @@ function isEndTimeColumnError(error) {
 
   if (!supabase) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView edges={["top", "bottom", "left", "right"]} style={styles.container}>
         <Text style={styles.title}>Planner Mobile</Text>
         <Text style={styles.errorText}>Supabase config missing.</Text>
         <Text style={styles.helpText}>Set supabaseUrl and supabaseAnonKey in app.json.</Text>
@@ -6584,7 +8938,7 @@ function isEndTimeColumnError(error) {
 
   if (!session) {
     return (
-      <SafeAreaView style={[styles.container, styles.authScreen]}>
+      <SafeAreaView edges={["top", "bottom", "left", "right"]} style={[styles.container, styles.authScreen]}>
         <KeyboardAvoidingView
           style={styles.authFlex}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -6699,7 +9053,9 @@ function isEndTimeColumnError(error) {
   }
 
   return (
-    <NavigationContainer>
+    <>
+      <StatusBar style={themeMode === "dark" ? "light" : "dark"} translucent backgroundColor="transparent" />
+      <NavigationContainer>
       <SettingsSheet
         visible={settingsVisible}
         themeMode={themeMode}
@@ -6727,15 +9083,38 @@ function isEndTimeColumnError(error) {
         }}
         onClose={() => setSettingsVisible(false)}
       />
+      <TasksSheet
+        visible={tasksVisible}
+        tone={tone}
+        tasks={taskItems}
+        onToggleTask={toggleTaskCompletion}
+        onOpenTask={openTaskItem}
+        onClose={() => setTasksVisible(false)}
+      />
+      <DdaySheet
+        visible={ddayVisible}
+        tone={tone}
+        items={upcomingDdayItems}
+        onOpenItem={openTaskItem}
+        onClose={() => setDdayVisible(false)}
+      />
       <PlanEditorModal
         visible={planEditorVisible}
         draft={planDraft}
         windows={windows}
         tone={tone}
         onClose={() => setPlanEditorVisible(false)}
-        onSave={async (next) => {
-          const ok = await upsertPlan(session?.user?.id, next)
-          if (ok) setPlanEditorVisible(false)
+        onSave={(next) => {
+          const nextDraft = { ...(next ?? {}) }
+          setPlanDraft(nextDraft)
+          setPlanEditorVisible(false)
+          ;(async () => {
+            const ok = await upsertPlan(session?.user?.id, nextDraft)
+            if (!ok) {
+              setPlanDraft(nextDraft)
+              setPlanEditorVisible(true)
+            }
+          })()
         }}
         onDelete={async (target) => {
           const ok = await softDeletePlan(session?.user?.id, target)
@@ -6767,7 +9146,7 @@ function isEndTimeColumnError(error) {
           tabBarStyle,
           sceneStyle: { paddingBottom: sceneBottomInset },
           tabBarLabelStyle: styles.tabLabel,
-          tabBarItemStyle: styles.tabItem,
+          tabBarItemStyle,
           tabBarActiveTintColor: ACCENT_BLUE,
           tabBarInactiveTintColor: tone === "dark" ? DARK_MUTED : "#94a3b8",
           tabBarHideOnKeyboard: true,
@@ -6809,6 +9188,11 @@ function isEndTimeColumnError(error) {
               onQuickDeletePlan={async (item) => {
                 await softDeletePlan(session?.user?.id, { ...(item ?? {}), delete_scope: "single" })
               }}
+              onTasks={() => setTasksVisible(true)}
+              tasksCount={taskCount}
+              onDdays={() => setDdayVisible(true)}
+              ddayCount={ddayCount}
+              onToggleTask={toggleTaskCompletion}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -6835,6 +9219,12 @@ function isEndTimeColumnError(error) {
               onChangeWindowColor={changeWindowColor}
               onReorderWindows={reorderWindows}
               onSaveMemo={saveRightMemo}
+              onStageMemo={stageRightMemoWrite}
+              onTasks={() => setTasksVisible(true)}
+              tasksCount={taskCount}
+              onDdays={() => setDdayVisible(true)}
+              ddayCount={ddayCount}
+              onToggleTask={toggleTaskCompletion}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -6871,6 +9261,11 @@ function isEndTimeColumnError(error) {
               onSelectDateKey={(key) => {
                 lastCalendarDateKeyRef.current = key
               }}
+              onTasks={() => setTasksVisible(true)}
+              tasksCount={taskCount}
+              onToggleTask={toggleTaskCompletion}
+              onDdays={() => setDdayVisible(true)}
+              ddayCount={ddayCount}
               onRefresh={() => {
                 loadPlans(session?.user?.id)
                 loadWindows(session?.user?.id)
@@ -6882,16 +9277,18 @@ function isEndTimeColumnError(error) {
           )}
         </Tab.Screen>
       </Tab.Navigator>
-      {Platform.OS === "android" ? <View pointerEvents="none" style={androidNavStripStyle} /> : null}
-    </NavigationContainer>
+      </NavigationContainer>
+    </>
   )
 }
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <AppInner />
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <AppInner />
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   )
 }
 
@@ -6910,7 +9307,7 @@ const styles = StyleSheet.create({
     paddingTop: 1,
     borderTopWidth: 1,
     borderTopColor: "transparent",
-    backgroundColor: "#f8fafc",
+    backgroundColor: "#f5f7fb",
     shadowColor: "#0f172a",
     shadowOpacity: 0.4,
     shadowRadius: 10,
@@ -6928,7 +9325,7 @@ const styles = StyleSheet.create({
     bottom: 0
   },
   androidNavStripLight: {
-    backgroundColor: "#e2e8f0"
+    backgroundColor: "#f5f7fb"
   },
   androidNavStripDark: {
     backgroundColor: "#0f172a"
@@ -6940,19 +9337,21 @@ const styles = StyleSheet.create({
     color: DARK_MUTED
   },
   tabItem: {
-    paddingTop: 1,
-    paddingBottom: 5
+    paddingTop: 0,
+    paddingBottom: 8,
+    justifyContent: "center",
+    alignItems: "center"
   },
   tabLabel: {
     fontSize: 11,
     fontWeight: "800",
-    marginTop: -4
+    marginTop: -3
   },
   tabIcon: {
     fontSize: 18,
     fontWeight: "800",
     color: "#94a3b8",
-    transform: [{ translateY: -1 }]
+    transform: [{ translateY: -2 }]
   },
   tabIconDark: {
     color: DARK_MUTED
@@ -7149,6 +9548,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 10
   },
+  headerLeftPressable: {
+    borderRadius: 14
+  },
   headerTitleWrapNoLogo: {
     paddingLeft: 15
   },
@@ -7205,9 +9607,13 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   headerTodayText: {
-    fontSize: 12,
-    fontWeight: "800",
-    lineHeight: 14,
+    width: "100%",
+    fontSize: 11,
+    fontWeight: "900",
+    lineHeight: 12,
+    letterSpacing: -0.2,
+    textAlign: "center",
+    includeFontPadding: false,
     color: ACCENT_BLUE
   },
   headerTodayTextDark: {
@@ -7239,6 +9645,138 @@ const styles = StyleSheet.create({
     height: 6,
     borderRadius: 999,
     backgroundColor: ACCENT_BLUE
+  },
+  headerMoreButton: {
+    width: 38,
+    height: 38,
+    borderRadius: 14,
+    backgroundColor: "rgba(43, 103, 199, 0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(43, 103, 199, 0.18)",
+    alignItems: "center",
+    justifyContent: "center",
+    position: "relative"
+  },
+  headerMoreText: {
+    fontSize: 22,
+    lineHeight: 22,
+    marginTop: -6,
+    fontWeight: "900",
+    color: ACCENT_BLUE
+  },
+  headerTasksButton: {
+    width: 38,
+    height: 38,
+    paddingHorizontal: 0,
+    borderRadius: 14,
+    backgroundColor: "rgba(43, 103, 199, 0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(43, 103, 199, 0.18)",
+    alignItems: "center",
+    justifyContent: "center",
+    position: "relative"
+  },
+  headerTasksButtonActive: {
+    backgroundColor: "#eef4ff",
+    borderColor: "#bfd5fb"
+  },
+  headerTasksButtonActiveDark: {
+    backgroundColor: "rgba(59, 130, 246, 0.18)",
+    borderColor: "rgba(125, 211, 252, 0.28)"
+  },
+  headerTasksText: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: ACCENT_BLUE
+  },
+  headerTasksIconText: {
+    fontSize: 18,
+    lineHeight: 18,
+    marginTop: -1
+  },
+  headerTasksBadge: {
+    position: "absolute",
+    top: -4,
+    right: -4,
+    minWidth: 18,
+    height: 18,
+    paddingHorizontal: 4,
+    borderRadius: 999,
+    backgroundColor: ACCENT_BLUE,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  headerTasksBadgeDark: {
+    backgroundColor: "#60a5fa"
+  },
+  headerTasksBadgeText: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: "#ffffff"
+  },
+  headerQuickSheetCard: {
+    maxHeight: "56%"
+  },
+  headerQuickActions: {
+    gap: 10,
+    paddingTop: 6,
+    paddingBottom: 4
+  },
+  headerQuickAction: {
+    minHeight: 58,
+    borderRadius: 16,
+    backgroundColor: "#f8fbff",
+    borderWidth: 1,
+    borderColor: "#d8e5f6",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12
+  },
+  headerQuickActionDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER
+  },
+  headerQuickActionDanger: {
+    backgroundColor: "#fff1f2",
+    borderColor: "#fecdd3"
+  },
+  headerQuickActionCopy: {
+    flex: 1,
+    gap: 4
+  },
+  headerQuickActionTitle: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  headerQuickActionTitleDanger: {
+    color: "#e11d48"
+  },
+  headerQuickActionHint: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b",
+    lineHeight: 17
+  },
+  headerQuickActionBadge: {
+    minWidth: 28,
+    height: 28,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    backgroundColor: "#e7efff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  headerQuickActionBadgeDark: {
+    backgroundColor: "rgba(96, 165, 250, 0.18)"
+  },
+  headerQuickActionBadgeText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: ACCENT_BLUE
   },
   title: {
     fontSize: 24,
@@ -7441,7 +9979,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     paddingHorizontal: 6,
     height: 40,
-    backgroundColor: "#f6f9fe",
+    backgroundColor: "#f7faff",
     borderTopWidth: StyleSheet.hairlineWidth,
     borderBottomWidth: 0,
     borderTopColor: "#e1e9f4",
@@ -7474,21 +10012,36 @@ const styles = StyleSheet.create({
     padding: 0
   },
   listMonthNavButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 0,
-    backgroundColor: "transparent",
+    width: 28,
+    height: 28,
+    borderRadius: 9,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#d9e4f2",
     alignItems: "center",
-    justifyContent: "center"
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0,
+    shadowRadius: 0,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 0
+  },
+  listMonthNavButtonDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.06)",
+    borderColor: "rgba(255, 255, 255, 0.12)",
+    shadowOpacity: 0
   },
   listMonthNavText: {
-    fontSize: 22,
+    fontSize: 20,
     fontWeight: "900",
-    color: ACCENT_BLUE,
+    color: "#5f77a8",
     includeFontPadding: false,
     textAlign: "center",
-    lineHeight: 24,
-    transform: [{ translateY: -1.5 }]
+    lineHeight: 20,
+    transform: [{ translateY: -0.5 }]
+  },
+  listMonthNavTextDark: {
+    color: DARK_TEXT
   },
   listMonthRightGroup: {
     flexDirection: "row",
@@ -7518,7 +10071,7 @@ const styles = StyleSheet.create({
     borderWidth: 0,
     alignItems: "center",
     justifyContent: "center",
-    transform: [{ translateX: -4 }]
+    transform: [{ translateX: -8 }]
   },
   listPillDark: {
     backgroundColor: "rgba(255, 255, 255, 0.06)",
@@ -7541,9 +10094,9 @@ const styles = StyleSheet.create({
     height: 32,
     paddingHorizontal: 8,
     borderRadius: 8,
-    backgroundColor: "transparent",
+    backgroundColor: "#f8fbff",
     borderWidth: 1,
-    borderColor: "rgba(148, 163, 184, 0.22)"
+    borderColor: "#d7e3f4"
   },
   tabPillAll: {
     minWidth: 72,
@@ -7551,7 +10104,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6
   },
   tabPillActive: {
-    backgroundColor: "#ffffff",
+    backgroundColor: "#eef4ff",
+    borderColor: "#bfd4fb",
     shadowColor: "#0f172a",
     shadowOpacity: 0.06,
     shadowRadius: 10,
@@ -7559,11 +10113,12 @@ const styles = StyleSheet.create({
     elevation: 2
   },
   tabPillDark: {
-    backgroundColor: "transparent",
-    borderColor: DARK_BORDER
+    backgroundColor: "rgba(148, 163, 184, 0.10)",
+    borderColor: "rgba(148, 163, 184, 0.24)"
   },
   tabPillActiveDark: {
-    backgroundColor: DARK_SURFACE_2
+    backgroundColor: "rgba(59, 130, 246, 0.18)",
+    borderColor: "rgba(125, 211, 252, 0.28)"
   },
   tabPillGhost: {
     backgroundColor: "#ffffff",
@@ -7591,19 +10146,19 @@ const styles = StyleSheet.create({
   tabText: {
     fontSize: 13,
     fontWeight: "800",
-    color: "#64748b"
+    color: "#475569"
   },
   tabTextAll: {
     textAlign: "center"
   },
   tabTextActive: {
-    color: "#0f172a"
+    color: "#1d4ed8"
   },
   tabTextDark: {
-    color: DARK_MUTED
+    color: "rgba(226, 232, 240, 0.82)"
   },
   tabTextActiveDark: {
-    color: DARK_TEXT
+    color: "#e0f2fe"
   },
   tabDot: {
     width: 8,
@@ -7958,6 +10513,69 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 10
   },
+  itemTaskDividerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingTop: 6,
+    paddingBottom: 5,
+    paddingHorizontal: 0
+  },
+  itemTaskDividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: "#bcc9dd"
+  },
+  itemTaskDividerLineDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.22)"
+  },
+  itemBucketDividerRow: {
+    paddingTop: 5,
+    paddingBottom: 4,
+    paddingHorizontal: 0
+  },
+  itemBucketDividerLine: {
+    height: 1,
+    backgroundColor: "#c5d3e6"
+  },
+  itemBucketDividerLineDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.18)"
+  },
+  itemPrimaryRow: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9
+  },
+  itemTaskToggle: {
+    width: 19,
+    height: 19,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: "#cbd5e1",
+    backgroundColor: "#ffffff",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0
+  },
+  itemTaskToggleDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.04)",
+    borderColor: DARK_BORDER
+  },
+  itemTaskToggleChecked: {
+    backgroundColor: "rgba(59, 130, 246, 0.14)",
+    borderColor: "rgba(59, 130, 246, 0.34)"
+  },
+  itemTaskToggleCheckedDark: {
+    backgroundColor: "rgba(125, 211, 252, 0.12)",
+    borderColor: "rgba(125, 211, 252, 0.28)"
+  },
+  itemTaskToggleTick: {
+    color: "#5375b6",
+    fontSize: 11,
+    fontWeight: "900",
+    marginTop: -1
+  },
   itemTitle: {
     flex: 1,
     fontSize: 14,
@@ -7965,22 +10583,28 @@ const styles = StyleSheet.create({
     color: "#0f172a",
     transform: [{ translateY: -1 }]
   },
+  itemTitleTaskDone: {
+    color: "#94a3b8",
+    opacity: 0.78,
+    textDecorationLine: "line-through",
+    textDecorationColor: "#64748b"
+  },
   itemCategoryBadge: {
     flexShrink: 0,
     maxWidth: "100%",
     height: 20,
     paddingHorizontal: 10,
     borderRadius: 999,
-    backgroundColor: "#f8fafc",
+    backgroundColor: "#f8fbff",
     borderWidth: 1,
-    borderColor: "#e2e8f0",
+    borderColor: "#d7e3f4",
     flexDirection: "row",
     alignItems: "center",
     gap: 6
   },
   badgeDark: {
-    backgroundColor: "rgba(255, 255, 255, 0.06)",
-    borderColor: DARK_BORDER
+    backgroundColor: "rgba(148, 163, 184, 0.10)",
+    borderColor: "rgba(148, 163, 184, 0.24)"
   },
   itemCategoryDot: {
     width: 8,
@@ -7991,7 +10615,7 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     fontSize: 11,
     fontWeight: "900",
-    color: "#475569"
+    color: "#334155"
   },
   memoContent: {
     paddingTop: 8,
@@ -8004,23 +10628,50 @@ const styles = StyleSheet.create({
     paddingHorizontal: 0,
     gap: 10
   },
-  memoAllCard: {
-    backgroundColor: "#ffffff",
+  memoAllEmptyCard: {
     borderRadius: 16,
     borderWidth: 1,
     borderColor: "#e2e8f0",
-    padding: 12
+    backgroundColor: "#ffffff",
+    paddingVertical: 22,
+    paddingHorizontal: 16,
+    alignItems: "center"
+  },
+  memoAllEmptyCardDark: {
+    backgroundColor: DARK_SURFACE,
+    borderColor: DARK_BORDER
+  },
+  memoAllEmptyTitle: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoAllEmptyText: {
+    marginTop: 6,
+    fontSize: 12,
+    lineHeight: 18,
+    fontWeight: "700",
+    color: "#64748b",
+    textAlign: "center"
+  },
+  memoAllCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    padding: 14
   },
   memoAllHeader: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
-    marginBottom: 8
+    gap: 12
   },
   memoAllHeaderLeft: {
     flexDirection: "row",
-    alignItems: "center",
-    gap: 8
+    alignItems: "flex-start",
+    gap: 10,
+    flex: 1
   },
   memoAllHeaderRight: {
     flexDirection: "row",
@@ -8028,18 +10679,73 @@ const styles = StyleSheet.create({
     gap: 8
   },
   memoAllDot: {
-    width: 10,
-    height: 10,
+    width: 12,
+    height: 12,
     borderRadius: 999
   },
+  memoAllHeaderTextWrap: {
+    flex: 1,
+    gap: 4
+  },
+  memoAllTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8
+  },
   memoAllTitle: {
-    fontSize: 13,
+    fontSize: 15,
     fontWeight: "900",
     color: "#0f172a"
   },
+  memoAllMetaText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#64748b"
+  },
+  memoAllMetaRow: {
+    marginTop: 2,
+    marginBottom: 7
+  },
+  memoAllDocTitleInput: {
+    minHeight: 36,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d7e3f4",
+    backgroundColor: "#f8fbff",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#334155"
+  },
+  memoAllDocTitleInputDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER,
+    color: DARK_TEXT
+  },
+  memoAllDocBadge: {
+    minHeight: 28,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d7e3f4",
+    backgroundColor: "#f8fbff",
+    paddingHorizontal: 12,
+    alignItems: "flex-start",
+    justifyContent: "center"
+  },
+  memoAllDocBadgeDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER
+  },
+  memoAllDocBadgeText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#334155"
+  },
   memoAllBody: {
     fontSize: 13,
-    lineHeight: 19,
+    lineHeight: 20,
     fontWeight: "600",
     color: "#0f172a"
   },
@@ -8047,17 +10753,17 @@ const styles = StyleSheet.create({
     backgroundColor: "#f8fafc",
     borderWidth: 1,
     borderColor: "#e2e8f0",
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    minHeight: 140,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    minHeight: 156,
     fontWeight: "600",
     color: "#0f172a"
   },
   memoAllEditBtn: {
-    height: 28,
-    minWidth: 50,
-    paddingHorizontal: 10,
+    height: 30,
+    minWidth: 52,
+    paddingHorizontal: 12,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: "#d7e3f4",
@@ -8066,27 +10772,499 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   memoAllEditBtnText: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: "800",
     color: "#1d4ed8"
   },
-  memoAllChevronBtn: {
-    width: 22,
-    height: 22,
+  memoDocTabsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 8,
+    gap: 8,
+    marginBottom: 7
+  },
+  memoDocTabsScroll: {
+    flex: 1
+  },
+  memoDocTabs: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingRight: 4
+  },
+  memoDocTab: {
+    minHeight: 28,
+    paddingLeft: 12,
+    paddingRight: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d7e3f4",
+    backgroundColor: "#f8fafc",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  memoDocTabCentered: {
+    justifyContent: "center",
+    paddingRight: 12
+  },
+  memoDocTabWithDelete: {
+    justifyContent: "flex-start",
+    paddingRight: 4
+  },
+  memoDocTabDark: {
+    borderColor: DARK_BORDER,
+    backgroundColor: DARK_SURFACE
+  },
+  memoDocTabActive: {
+    backgroundColor: "#eef4ff",
+    borderColor: "#bfd7ff"
+  },
+  memoDocTabActiveDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: "rgba(96, 165, 250, 0.45)"
+  },
+  memoDocTabText: {
+    fontSize: 12,
+    lineHeight: 12,
+    fontWeight: "800",
+    color: "#475569",
+    includeFontPadding: false,
+    textAlignVertical: "center"
+  },
+  memoDocTabTextDark: {
+    color: DARK_MUTED
+  },
+  memoDocTabTextActive: {
+    color: "#1d4ed8"
+  },
+  memoDocTabTextActiveDark: {
+    color: DARK_TEXT
+  },
+  memoDocTabPressable: {
+    minWidth: 0,
+    flexShrink: 1,
     alignItems: "center",
     justifyContent: "center"
+  },
+  memoDocTabDeleteBtn: {
+    width: 16,
+    height: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "transparent"
+  },
+  memoDocTabDeleteBtnActive: {
+    backgroundColor: "transparent"
+  },
+  memoDocTabDeleteText: {
+    fontSize: 13,
+    lineHeight: 13,
+    fontWeight: "700",
+    color: "#e11d48",
+    includeFontPadding: false,
+    textAlignVertical: "center",
+    transform: [{ translateY: 0.75 }]
+  },
+  memoDocTabDeleteTextActive: {
+    color: "#e11d48"
+  },
+  memoDocTabDeleteTextDark: {
+    color: "#f43f5e"
+  },
+  memoDocActionBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#d7e3f4",
+    backgroundColor: "#eef4ff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoDocActionBtnDark: {
+    borderColor: DARK_BORDER,
+    backgroundColor: DARK_SURFACE
+  },
+  memoDocActionText: {
+    fontSize: 16,
+    lineHeight: 16,
+    fontWeight: "800",
+    color: "#1d4ed8"
+  },
+  memoDocActionTextDark: {
+    color: DARK_TEXT
+  },
+  memoAllChevronBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 999,
+    backgroundColor: "#f8fafc",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoAllChevronBtnDark: {
+    backgroundColor: DARK_SURFACE_2
   },
   memoAllChevron: {
     fontSize: 16,
     fontWeight: "700",
     color: "#94a3b8"
   },
+  memoAllPreviewCard: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#fbfdff",
+    paddingHorizontal: 14,
+    paddingVertical: 11
+  },
+  memoAllPreviewCardDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER
+  },
   memoAllEmpty: {
     fontSize: 12,
     fontWeight: "700",
     color: "#94a3b8"
   },
+  memoSinglePane: {
+    paddingTop: 10,
+    paddingBottom: 14,
+    minHeight: 520
+  },
+  memoSingleHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    paddingHorizontal: 2,
+    gap: 12,
+    marginBottom: 14
+  },
+  memoSingleHeaderDark: {
+    borderColor: DARK_BORDER
+  },
+  memoSingleHeaderLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flex: 1
+  },
+  memoSingleHeaderTextWrap: {
+    flex: 1,
+    gap: 2
+  },
+  memoSingleTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoSingleSubtitle: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#94a3b8"
+  },
+  memoSingleActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  memoSingleActionBtn: {
+    height: 36,
+    borderRadius: 14,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoSingleActionBtnCompact: {
+    height: 32,
+    borderRadius: 12
+  },
+  memoSingleActionBtnTextual: {
+    minWidth: 58,
+    paddingHorizontal: 10
+  },
+  memoSingleActionBtnDark: {
+    borderColor: DARK_BORDER
+  },
+  memoSingleActionBtnNeutral: {
+    minWidth: 68,
+    paddingHorizontal: 10,
+    borderColor: "#d7e3f4",
+    backgroundColor: "#ffffff"
+  },
+  memoSingleActionBtnNeutralDark: {
+    borderColor: DARK_BORDER,
+    backgroundColor: DARK_SURFACE
+  },
+  memoSingleActionBtnNeutralText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#475569"
+  },
+  memoSingleActionBtnDanger: {
+    width: 36,
+    borderColor: "#fecdd3",
+    backgroundColor: "#fff1f2"
+  },
+  memoSingleActionBtnDangerDark: {
+    borderColor: "rgba(248, 113, 113, 0.35)",
+    backgroundColor: "rgba(225, 29, 72, 0.14)"
+  },
+  memoSingleActionBtnDangerText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#e11d48"
+  },
+  memoSingleActionBtnDangerWide: {
+    borderColor: "#fecdd3",
+    backgroundColor: "#fff1f2"
+  },
+  memoSingleActionBtnPrimary: {
+    minWidth: 52,
+    paddingHorizontal: 10,
+    borderColor: "#bfd7ff",
+    backgroundColor: "#eef4ff"
+  },
+  memoSingleActionBtnPrimaryDark: {
+    borderColor: "rgba(96, 165, 250, 0.45)",
+    backgroundColor: "rgba(59, 130, 246, 0.16)"
+  },
+  memoSingleActionBtnPrimaryText: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#1d4ed8"
+  },
+  memoSingleActionBtnDisabled: {
+    borderColor: "#e5e7eb",
+    backgroundColor: "#f8fafc"
+  },
+  memoSingleActionBtnDisabledText: {
+    color: "#cbd5e1"
+  },
+  memoSingleSearchRow: {
+    height: 44,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#ffffff",
+    paddingLeft: 14,
+    paddingRight: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 12
+  },
+  memoSingleSearchRowDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER
+  },
+  memoSingleSearchInput: {
+    flex: 1,
+    padding: 0,
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#0f172a"
+  },
+  memoSingleSearchIcon: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#94a3b8"
+  },
+  memoSingleList: {
+    gap: 8,
+    paddingBottom: 90
+  },
+  memoSingleItem: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#ffffff",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12
+  },
+  memoSingleItemDark: {
+    backgroundColor: DARK_SURFACE,
+    borderColor: DARK_BORDER
+  },
+  memoSingleItemSelected: {
+    borderColor: "#bfd7ff",
+    backgroundColor: "#f8fbff"
+  },
+  memoSingleItemSelectedDark: {
+    borderColor: "rgba(96, 165, 250, 0.45)",
+    backgroundColor: "rgba(59, 130, 246, 0.12)"
+  },
+  memoSingleItemPressable: {
+    flex: 1
+  },
+  memoSingleSelectDot: {
+    width: 24,
+    height: 24,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: "#cbd5e1",
+    backgroundColor: "#ffffff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoSingleSelectDotActive: {
+    borderColor: "#3b82f6",
+    backgroundColor: "#3b82f6"
+  },
+  memoSingleSelectDotActiveText: {
+    fontSize: 13,
+    lineHeight: 13,
+    fontWeight: "900",
+    color: "#ffffff"
+  },
+  memoSingleItemMain: {
+    gap: 6
+  },
+  memoSingleItemTitle: {
+    fontSize: 15,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoSingleItemPreview: {
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "600",
+    color: "#64748b"
+  },
+  memoSingleItemDeleteBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: "#fff1f2",
+    borderWidth: 1,
+    borderColor: "#fecdd3",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memoSingleItemDeleteBtnDark: {
+    backgroundColor: "rgba(220, 38, 38, 0.14)",
+    borderColor: "rgba(248, 113, 113, 0.28)"
+  },
+  memoSingleItemDeleteText: {
+    fontSize: 15,
+    lineHeight: 15,
+    fontWeight: "900",
+    color: "#e11d48"
+  },
+  memoSingleEmpty: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#ffffff",
+    paddingVertical: 28,
+    paddingHorizontal: 16,
+    alignItems: "center"
+  },
+  memoSingleEmptyDark: {
+    backgroundColor: DARK_SURFACE,
+    borderColor: DARK_BORDER
+  },
+  memoSingleEmptyTitle: {
+    fontSize: 14,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoSingleEmptyText: {
+    marginTop: 8,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b",
+    textAlign: "center"
+  },
+  memoSingleFab: {
+    position: "absolute",
+    right: 12,
+    bottom: 16,
+    width: 58,
+    height: 58,
+    borderRadius: 20,
+    backgroundColor: "#4b5f78",
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.18,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 10
+  },
+  memoSingleFabText: {
+    fontSize: 32,
+    lineHeight: 32,
+    fontWeight: "700",
+    color: "#ffffff",
+    marginTop: -2
+  },
+  memoSingleEditorCard: {
+    paddingTop: 2,
+    paddingBottom: 4,
+    paddingHorizontal: 0,
+    gap: 14,
+    backgroundColor: "transparent",
+    borderWidth: 0,
+    borderColor: "transparent",
+    borderRadius: 0,
+    shadowOpacity: 0,
+    shadowRadius: 0,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 0
+  },
+  memoSingleEditorCardDark: {
+    backgroundColor: "transparent",
+    borderColor: "transparent"
+  },
+  memoSingleFieldBlock: {
+    gap: 8
+  },
+  memoSingleFieldLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#64748b"
+  },
+  memoSingleTitleInput: {
+    height: 50,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#dbe5f1",
+    backgroundColor: "#f8fbff",
+    paddingHorizontal: 14,
+    fontSize: 17,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  memoSingleFieldDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER
+  },
+  memoSingleContentField: {
+    minHeight: 300,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#dbe5f1",
+    backgroundColor: "#fbfdff",
+    paddingHorizontal: 14,
+    paddingVertical: 12
+  },
+  memoSingleBodyInput: {
+    padding: 0,
+    minHeight: 274,
+    borderWidth: 0,
+    borderColor: "transparent",
+    backgroundColor: "transparent",
+    borderRadius: 0,
+    fontWeight: "600",
+    color: "#0f172a"
+  },
   memoEditorWrap: {
+    position: "relative",
     flex: 1,
     paddingTop: 0,
     paddingBottom: 0,
@@ -8221,10 +11399,14 @@ const styles = StyleSheet.create({
   },
   calendarHeaderLeft: {
     position: "absolute",
-    left: 10,
+    left: 2,
     top: 0,
     bottom: 0,
-    justifyContent: "center"
+    width: 56,
+    justifyContent: "center",
+    alignItems: "flex-start",
+    paddingLeft: 4,
+    zIndex: 2
   },
   calendarTitleCentered: {
     position: "absolute",
@@ -8238,12 +11420,13 @@ const styles = StyleSheet.create({
   },
   calendarHeaderRight: {
     position: "absolute",
-    right: 10,
+    right: 2,
     top: 0,
     bottom: 0,
     flexDirection: "row",
     alignItems: "center",
-    gap: 6
+    gap: 6,
+    paddingRight: 4
   },
   calendarCard: {
     flex: 1,
@@ -8270,7 +11453,7 @@ const styles = StyleSheet.create({
     paddingTop: 8,
     paddingBottom: 0,
     paddingHorizontal: 0,
-    backgroundColor: "#ffffff"
+    backgroundColor: "#f5f7fb"
   },
   calendarHeaderWrapDark: {
     backgroundColor: DARK_SURFACE
@@ -8294,8 +11477,8 @@ const styles = StyleSheet.create({
     paddingTop: 2
   },
   calendarNavButton: {
-    width: 32,
-    height: 32,
+    width: 38,
+    height: 38,
     borderRadius: 12,
     backgroundColor: "#eef2ff",
     borderWidth: 1,
@@ -8372,13 +11555,14 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     borderWidth: 0.8,
     borderColor: "#dfe7f3",
-    borderTopWidth: 0
+    borderTopWidth: 0,
+    overflow: "hidden"
   },
   calendarGridDark: {
     borderColor: DARK_BORDER
   },
   calendarCell: {
-    width: "14.285%",
+    width: "14.285714%",
     borderRightWidth: 0.8,
     borderBottomWidth: 0.8,
     borderColor: "#e1e8f2",
@@ -8386,7 +11570,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 0,
     paddingBottom: 6,
     alignItems: "flex-start",
-    justifyContent: "flex-start"
+    justifyContent: "flex-start",
+    overflow: "hidden"
   },
   calendarCellDark: {
     borderColor: DARK_BORDER_SOFT
@@ -8493,7 +11678,8 @@ const styles = StyleSheet.create({
     width: "100%",
     gap: 1,
     marginTop: 4,
-    paddingHorizontal: 1
+    paddingHorizontal: 1,
+    overflow: "hidden"
   },
   calendarLine: {
     flexDirection: "row",
@@ -8516,6 +11702,14 @@ const styles = StyleSheet.create({
   },
   calendarLabelRange: {
     minHeight: 17
+  },
+  calendarLabelTaskPlain: {
+    paddingLeft: 1,
+    paddingRight: 1,
+    borderRadius: 0
+  },
+  calendarLabelTaskDone: {
+    opacity: 0.8
   },
   calendarLabelRow: {
     width: "100%",
@@ -8547,7 +11741,7 @@ const styles = StyleSheet.create({
   calendarLabelTime: {
     fontSize: 6,
     lineHeight: 8,
-    color: "rgba(255, 255, 255, 0.92)",
+    color: "#0f172a",
     fontWeight: "800",
     includeFontPadding: false,
     textAlignVertical: "center",
@@ -8557,18 +11751,59 @@ const styles = StyleSheet.create({
     lineHeight: 10
   },
   calendarLabelTimeDark: {
-    color: "rgba(11, 18, 32, 0.82)"
+    color: "rgba(255, 255, 255, 0.92)"
+  },
+  calendarLabelTimeTask: {
+    color: "#0f172a"
+  },
+  calendarLabelTimeTaskDark: {
+    color: "#f8fafc"
+  },
+  calendarTaskMarker: {
+    width: 8,
+    height: 8,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#94a3b8",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 3,
+    flexShrink: 0,
+    alignSelf: "center"
+  },
+  calendarTaskMarkerDark: {
+    borderColor: "#cbd5e1"
+  },
+  calendarTaskMarkerDone: {
+    backgroundColor: "#94a3b8",
+    opacity: 0.56
+  },
+  calendarTaskMarkerDoneDark: {
+    backgroundColor: "#cbd5e1",
+    opacity: 0.62
+  },
+  calendarTaskMarkerText: {
+    fontSize: 5,
+    lineHeight: 5,
+    fontWeight: "900",
+    color: "#ffffff",
+    includeFontPadding: false,
+    transform: [{ translateY: -0.1 }]
+  },
+  calendarTaskMarkerTextDark: {
+    color: "#ffffff"
   },
   calendarLabelText: {
     fontSize: 8,
     lineHeight: 10,
-    color: "#ffffff",
+    color: "#0f172a",
     fontWeight: "800",
     flex: 1,
     textAlign: "left",
     alignSelf: "center",
     includeFontPadding: false,
-    textAlignVertical: "center"
+    textAlignVertical: "center",
+    paddingRight: 2
   },
   calendarLabelTextSingle: {
     marginTop: -2
@@ -8577,7 +11812,21 @@ const styles = StyleSheet.create({
     alignSelf: "center"
   },
   calendarLabelTextDark: {
-    color: "#0b1220"
+    color: "#ffffff"
+  },
+  calendarLabelTextTask: {
+    color: "#0f172a",
+    alignSelf: "center"
+  },
+  calendarLabelTextTaskDark: {
+    color: "#ffffff",
+    alignSelf: "center"
+  },
+  calendarLabelTextTaskDone: {
+    color: "#94a3b8",
+    opacity: 0.78,
+    textDecorationLine: "line-through",
+    textDecorationColor: "#64748b"
   },
   calendarLineText: {
     flex: 1,
@@ -8628,9 +11877,9 @@ const styles = StyleSheet.create({
     bottom: 0
   },
   dayModalCard: {
-    width: "92%",
+    width: "94%",
     alignSelf: "center",
-    maxWidth: 520,
+    maxWidth: 760,
     maxHeight: "78%",
     backgroundColor: "#ffffff",
     borderRadius: 16,
@@ -8762,10 +12011,36 @@ const styles = StyleSheet.create({
     fontWeight: "900",
     color: "#94a3b8"
   },
+  dayModalItemMain: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  dayModalItemPrimary: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9
+  },
   dayModalItemText: {
     flex: 1,
+    minWidth: 0,
     fontSize: 13,
     color: "#0f172a"
+  },
+  dayModalDividerRow: {
+    paddingHorizontal: 0
+  },
+  dayModalDividerLine: {
+    height: 1,
+    backgroundColor: "#c5d3e6"
+  },
+  dayModalDividerLineDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.18)"
   },
   reorderCard: {
     width: "92%",
@@ -8870,14 +12145,21 @@ const styles = StyleSheet.create({
   reorderScrollContent: {
     paddingBottom: 10
   },
+  reorderBucketWrap: {
+    gap: 0
+  },
   reorderSection: {
     marginTop: 10
+  },
+  reorderSectionFirst: {
+    marginTop: 0
   },
   reorderSectionTitle: {
     fontSize: 13,
     fontWeight: "900",
     color: "#334155",
-    marginBottom: 8
+    marginBottom: 8,
+    paddingLeft: 8
   },
   reorderNoTimeList: {
     position: "relative"
@@ -9088,8 +12370,8 @@ const styles = StyleSheet.create({
     color: "#64748b"
   },
   editorCard: {
-    width: "92%",
-    maxWidth: 520,
+    width: "94%",
+    maxWidth: 760,
     maxHeight: "82%",
     backgroundColor: "#ffffff",
     borderRadius: 16,
@@ -9117,14 +12399,34 @@ const styles = StyleSheet.create({
   },
   editorHeader: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
-    marginBottom: 10
+    gap: 12,
+    marginBottom: 6
+  },
+  editorHeaderMain: {
+    flex: 1,
+    minWidth: 0
+  },
+  editorHeaderLabel: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#475569",
+    marginBottom: 8
   },
   editorTitle: {
     fontSize: 16,
     fontWeight: "900",
     color: "#0f172a"
+  },
+  editorHeaderTypeScroll: {
+    maxHeight: 34
+  },
+  editorHeaderTypeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingRight: 8
   },
   editorCloseBtn: {
     height: 32,
@@ -9145,7 +12447,13 @@ const styles = StyleSheet.create({
     color: "#334155"
   },
   editorMetaRow: {
-    marginTop: 10
+    marginTop: 8
+  },
+  editorRepeatMetaRow: {
+    marginTop: 8
+  },
+  editorSectionGapLarge: {
+    marginTop: 14
   },
   editorBody: {
     flexGrow: 0
@@ -9154,10 +12462,60 @@ const styles = StyleSheet.create({
     paddingBottom: 4
   },
   editorMetaLabel: {
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: "800",
     color: "#475569",
-    marginBottom: 6
+    marginBottom: 8
+  },
+  editorMetaLabelInline: {
+    marginBottom: 0
+  },
+  editorMetaLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginBottom: 8
+  },
+  editorMetaLabelRowTight: {
+    marginBottom: 8
+  },
+  editorInlineControl: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  editorInlineToggle: {
+    width: 38,
+    height: 22,
+    borderRadius: 999,
+    paddingHorizontal: 2,
+    justifyContent: "center"
+  },
+  editorInlineToggleDark: {
+    borderWidth: 1,
+    borderColor: DARK_BORDER
+  },
+  editorInlineToggleThumb: {
+    width: 18,
+    height: 18,
+    borderRadius: 999,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1
+  },
+  editorInlineToggleThumbDark: {
+    shadowOpacity: 0
+  },
+  editorInlineControlDisabled: {
+    opacity: 0.58
+  },
+  editorInlineControlLabel: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#475569"
   },
   editorMetaValue: {
     fontSize: 13,
@@ -9333,6 +12691,34 @@ const styles = StyleSheet.create({
   editorActionsCompact: {
     marginTop: 10
   },
+  editorFloatingActions: {
+    position: "absolute",
+    left: "4%",
+    right: "4%",
+    alignItems: "center",
+    zIndex: 30
+  },
+  editorActionsFloating: {
+    width: "92%",
+    maxWidth: 520,
+    marginTop: 0,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 16,
+    backgroundColor: "#ffffff",
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.12,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 10
+  },
+  editorActionsFloatingDark: {
+    backgroundColor: DARK_SURFACE,
+    borderWidth: 1,
+    borderColor: DARK_BORDER,
+    shadowOpacity: 0,
+    elevation: 0
+  },
   editorPickerRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -9483,6 +12869,54 @@ const styles = StyleSheet.create({
   },
   editorAlarmLeadTextActive: {
     color: ACCENT_BLUE
+  },
+  editorTaskStatusRow: {
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12
+  },
+  editorTaskStatusActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  editorTaskStatusPill: {
+    height: 30,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#d6dbe6",
+    backgroundColor: "#f8fafc",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  editorTaskStatusPillDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.06)",
+    borderColor: DARK_BORDER
+  },
+  editorTaskStatusPillActive: {
+    backgroundColor: "#eef2ff",
+    borderColor: "#c7d2fe"
+  },
+  editorTaskStatusPillActiveDark: {
+    backgroundColor: "rgba(43, 103, 199, 0.24)",
+    borderColor: "rgba(125, 211, 252, 0.42)"
+  },
+  editorTaskStatusText: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#475569"
+  },
+  editorTaskStatusTextActive: {
+    color: ACCENT_BLUE
+  },
+  editorDdayHint: {
+    marginTop: 6,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b"
   },
   sheetOverlay: {
     flex: 1,
@@ -9641,6 +13075,183 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "900",
     color: "#e11d48"
+  },
+  tasksSheetCard: {
+    maxHeight: "82%"
+  },
+  tasksSheetHeaderCopy: {
+    flex: 1,
+    paddingRight: 12
+  },
+  tasksSheetHint: {
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b",
+    lineHeight: 17
+  },
+  tasksSheetScroll: {
+    maxHeight: "100%"
+  },
+  tasksSheetContent: {
+    paddingTop: 4,
+    paddingBottom: 8,
+    gap: 14
+  },
+  tasksSheetSection: {
+    gap: 8
+  },
+  tasksSheetSectionHeader: {
+    paddingTop: 2
+  },
+  tasksSheetSectionTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  tasksSheetItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    backgroundColor: "#ffffff"
+  },
+  tasksSheetItemDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: DARK_BORDER
+  },
+  tasksSheetCheck: {
+    width: 22,
+    height: 22,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: "#60a5fa",
+    backgroundColor: "#ffffff",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  tasksSheetCheckDark: {
+    backgroundColor: DARK_SURFACE,
+    borderColor: "#7dd3fc"
+  },
+  tasksSheetCheckActive: {
+    backgroundColor: "rgba(59, 130, 246, 0.14)",
+    borderColor: "rgba(59, 130, 246, 0.34)"
+  },
+  tasksSheetCheckActiveDark: {
+    backgroundColor: "rgba(125, 211, 252, 0.12)",
+    borderColor: "rgba(125, 211, 252, 0.28)"
+  },
+  tasksSheetCheckText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "transparent",
+    includeFontPadding: false
+  },
+  tasksSheetCheckTextActive: {
+    color: "#5375b6"
+  },
+  tasksSheetDdayBadge: {
+    minWidth: 58,
+    height: 30,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "#fff1f2",
+    borderWidth: 1,
+    borderColor: "#fecdd3",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  tasksSheetDdayBadgeDark: {
+    backgroundColor: "rgba(248, 113, 113, 0.14)",
+    borderColor: "rgba(248, 113, 113, 0.22)"
+  },
+  tasksSheetDdayBadgeText: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: ACCENT_RED
+  },
+  tasksSheetItemBody: {
+    flex: 1,
+    gap: 6
+  },
+  tasksSheetTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 6
+  },
+  tasksSheetItemTitle: {
+    flexShrink: 1,
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#0f172a"
+  },
+  tasksSheetItemTitleDone: {
+    textDecorationLine: "line-through",
+    textDecorationColor: "#64748b",
+    color: "#94a3b8",
+    opacity: 0.78
+  },
+  tasksSheetMetaPill: {
+    height: 20,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  tasksSheetMetaPillDark: {
+    backgroundColor: "rgba(255, 255, 255, 0.06)",
+    borderColor: DARK_BORDER
+  },
+  tasksSheetMetaPillText: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: "#475569"
+  },
+  tasksSheetMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 8
+  },
+  tasksSheetMetaText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#64748b"
+  },
+  tasksSheetEmpty: {
+    marginTop: 2,
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: "#cbd5e1",
+    backgroundColor: "#f8fafc"
+  },
+  tasksSheetEmptyDark: {
+    backgroundColor: DARK_SURFACE_2,
+    borderColor: "rgba(148, 163, 184, 0.28)"
+  },
+  tasksSheetEmptyTitle: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: "#0f172a"
+  },
+  tasksSheetEmptyText: {
+    marginTop: 8,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 18,
+    color: "#64748b"
   },
   sheetPicker: {
     marginBottom: 6
